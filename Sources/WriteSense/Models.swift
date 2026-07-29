@@ -44,6 +44,88 @@ enum PatternCategory: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+enum EditClassification: String, Codable, CaseIterable {
+    case insertion
+    case deletion
+    case replacement
+    case wordOrder = "word_order"
+    case punctuation
+    case capitalization
+    case grammar
+    case style
+    case vocabulary
+    case unknown
+
+    var title: String {
+        switch self {
+        case .insertion: return "Insertion"
+        case .deletion: return "Deletion"
+        case .replacement: return "Replacement"
+        case .wordOrder: return "Word order"
+        case .punctuation: return "Punctuation"
+        case .capitalization: return "Capitalization"
+        case .grammar: return "Grammar"
+        case .style: return "Style"
+        case .vocabulary: return "Vocabulary"
+        case .unknown: return "Edit"
+        }
+    }
+}
+
+enum CorrectionSource: String, Codable {
+    case manualUserEdit = "manual_user_edit"
+    case acceptedSuggestion = "accepted_suggestion"
+    case editedSuggestion = "edited_suggestion"
+}
+
+enum SuggestionOutcome: String, Codable {
+    case accepted
+    case rejected
+    case edited
+    case ignored
+    case undone
+}
+
+enum TonePreference: String, Codable, CaseIterable, Identifiable {
+    case preserveVoice = "preserve_voice"
+    case neutral
+    case formal
+    case concise
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .preserveVoice: return "Preserve my voice"
+        case .neutral: return "Neutral"
+        case .formal: return "Formal"
+        case .concise: return "Concise"
+        }
+    }
+}
+
+struct PatternExample: Codable, Equatable, Identifiable {
+    let id: UUID
+    var before: String
+    var after: String
+    var observedAt: Date
+    var applicationBundleID: String?
+
+    init(
+        id: UUID = UUID(),
+        before: String,
+        after: String,
+        observedAt: Date = Date(),
+        applicationBundleID: String? = nil
+    ) {
+        self.id = id
+        self.before = before
+        self.after = after
+        self.observedAt = observedAt
+        self.applicationBundleID = applicationBundleID
+    }
+}
+
 struct LearnedPattern: Codable, Identifiable, Equatable {
     let id: UUID
     var category: PatternCategory
@@ -58,6 +140,12 @@ struct LearnedPattern: Codable, Identifiable, Equatable {
     var lastObservedAt: Date
     var applicationBundleID: String?
 
+    // Optional fields preserve compatibility with profiles created before
+    // generalized pattern clustering and supporting examples were introduced.
+    var generalizedKey: String?
+    var supportingExamples: [PatternExample]?
+    var exampleApplicationBundleID: String? = nil
+
     var isReliable: Bool {
         enabled && occurrenceCount >= 2 && confidence >= 0.55
     }
@@ -67,6 +155,49 @@ struct LearnedPattern: Codable, Identifiable, Equatable {
         guard total > 0 else { return 0 }
         return Double(acceptanceCount) / Double(total)
     }
+
+    var allExamples: [PatternExample] {
+        let primary = PatternExample(
+            id: id,
+            before: exampleBefore,
+            after: exampleAfter,
+            observedAt: lastObservedAt,
+            applicationBundleID: exampleApplicationBundleID ?? applicationBundleID
+        )
+        let additional = supportingExamples ?? []
+        return [primary] + additional.filter {
+            $0.before.caseInsensitiveCompare(exampleBefore) != .orderedSame ||
+                $0.after.caseInsensitiveCompare(exampleAfter) != .orderedSame
+        }
+    }
+}
+
+struct SuggestionPreference: Codable, Identifiable, Equatable {
+    let id: UUID
+    var generalizedKey: String
+    var category: PatternCategory
+    var applicationBundleID: String?
+    var acceptanceCount: Int
+    var rejectionCount: Int
+    var lastUpdatedAt: Date
+
+    init(
+        id: UUID = UUID(),
+        generalizedKey: String,
+        category: PatternCategory,
+        applicationBundleID: String?,
+        acceptanceCount: Int = 0,
+        rejectionCount: Int = 0,
+        lastUpdatedAt: Date = Date()
+    ) {
+        self.id = id
+        self.generalizedKey = generalizedKey
+        self.category = category
+        self.applicationBundleID = applicationBundleID
+        self.acceptanceCount = acceptanceCount
+        self.rejectionCount = rejectionCount
+        self.lastUpdatedAt = lastUpdatedAt
+    }
 }
 
 struct WritingProfile: Codable {
@@ -75,8 +206,160 @@ struct WritingProfile: Codable {
     var acceptedSuggestionCount = 0
     var rejectedSuggestionCount = 0
     var updatedAt = Date()
+    var vocabularySources: [String: Set<String>]? = nil
+    var suggestionPreferences: [SuggestionPreference]? = nil
 
     static let empty = WritingProfile()
+}
+
+struct CorrectionEvent: Codable, Identifiable, Equatable {
+    let id: UUID
+    let sessionID: UUID
+    var applicationName: String
+    var applicationBundleID: String
+    var changedFragmentBefore: String
+    var changedFragmentAfter: String
+    var classification: EditClassification
+    var category: PatternCategory
+    var source: CorrectionSource
+    var patternID: UUID?
+    var createdAt: Date
+
+    init(
+        id: UUID = UUID(),
+        sessionID: UUID,
+        applicationName: String,
+        applicationBundleID: String,
+        changedFragmentBefore: String,
+        changedFragmentAfter: String,
+        classification: EditClassification,
+        category: PatternCategory,
+        source: CorrectionSource = .manualUserEdit,
+        patternID: UUID? = nil,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.sessionID = sessionID
+        self.applicationName = applicationName
+        self.applicationBundleID = applicationBundleID
+        self.changedFragmentBefore = changedFragmentBefore
+        self.changedFragmentAfter = changedFragmentAfter
+        self.classification = classification
+        self.category = category
+        self.source = source
+        self.patternID = patternID
+        self.createdAt = createdAt
+    }
+}
+
+struct SuggestionFeedbackEvent: Codable, Identifiable, Equatable {
+    let id: UUID
+    var category: PatternCategory
+    var outcome: SuggestionOutcome
+    var wasPersonalized: Bool
+    var patternID: UUID?
+    var applicationBundleID: String?
+    var createdAt: Date
+
+    init(
+        id: UUID = UUID(),
+        category: PatternCategory,
+        outcome: SuggestionOutcome,
+        wasPersonalized: Bool,
+        patternID: UUID?,
+        applicationBundleID: String?,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.category = category
+        self.outcome = outcome
+        self.wasPersonalized = wasPersonalized
+        self.patternID = patternID
+        self.applicationBundleID = applicationBundleID
+        self.createdAt = createdAt
+    }
+}
+
+struct EditingSessionRecord: Codable, Identifiable, Equatable {
+    let id: UUID
+    var applicationName: String
+    var applicationBundleID: String
+    var startedAt: Date
+    var lastUpdatedAt: Date
+    var endedAt: Date?
+    var correctionCount: Int
+
+    init(
+        id: UUID,
+        applicationName: String,
+        applicationBundleID: String,
+        startedAt: Date = Date(),
+        lastUpdatedAt: Date = Date(),
+        endedAt: Date? = nil,
+        correctionCount: Int = 0
+    ) {
+        self.id = id
+        self.applicationName = applicationName
+        self.applicationBundleID = applicationBundleID
+        self.startedAt = startedAt
+        self.lastUpdatedAt = lastUpdatedAt
+        self.endedAt = endedAt
+        self.correctionCount = correctionCount
+    }
+}
+
+enum PrivacyAuditAction: String, Codable {
+    case accessibilityRequested = "accessibility_requested"
+    case learningEnabled = "learning_enabled"
+    case learningDisabled = "learning_disabled"
+    case applicationApproved = "application_approved"
+    case applicationRevoked = "application_revoked"
+    case secureFieldBlocked = "secure_field_blocked"
+    case privateContextBlocked = "private_context_blocked"
+    case dataExported = "data_exported"
+    case todayDataDeleted = "today_data_deleted"
+    case applicationDataDeleted = "application_data_deleted"
+    case personalizationReset = "personalization_reset"
+}
+
+struct PrivacyAuditEvent: Codable, Identifiable, Equatable {
+    let id: UUID
+    var action: PrivacyAuditAction
+    var applicationBundleID: String?
+    var createdAt: Date
+
+    init(
+        id: UUID = UUID(),
+        action: PrivacyAuditAction,
+        applicationBundleID: String? = nil,
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.action = action
+        self.applicationBundleID = applicationBundleID
+        self.createdAt = createdAt
+    }
+}
+
+struct WritingHistory: Codable, Equatable {
+    var correctionEvents: [CorrectionEvent]
+    var suggestionEvents: [SuggestionFeedbackEvent]
+    var editingSessions: [EditingSessionRecord]?
+    var privacyAuditEvents: [PrivacyAuditEvent]?
+
+    init(
+        correctionEvents: [CorrectionEvent] = [],
+        suggestionEvents: [SuggestionFeedbackEvent] = [],
+        editingSessions: [EditingSessionRecord]? = nil,
+        privacyAuditEvents: [PrivacyAuditEvent]? = nil
+    ) {
+        self.correctionEvents = correctionEvents
+        self.suggestionEvents = suggestionEvents
+        self.editingSessions = editingSessions
+        self.privacyAuditEvents = privacyAuditEvents
+    }
+
+    static let empty = WritingHistory()
 }
 
 struct Suggestion: Identifiable, Equatable {
@@ -131,10 +414,23 @@ struct CapturedParagraph {
     let elementFrame: CGRect?
 }
 
-struct CorrectionDiff {
+struct CorrectionDiff: Equatable {
     let before: String
     let after: String
     let isMeaningful: Bool
+    let classification: EditClassification
+
+    init(
+        before: String,
+        after: String,
+        isMeaningful: Bool,
+        classification: EditClassification = .unknown
+    ) {
+        self.before = before
+        self.after = after
+        self.isMeaningful = isMeaningful
+        self.classification = classification
+    }
 }
 
 struct SupportedApplication: Identifiable, Hashable {

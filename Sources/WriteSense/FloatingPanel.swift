@@ -197,6 +197,11 @@ struct FloatingSuggestionView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(2)
+                            if let reason = suggestion.personalizationReason, suggestion.isPersonalized {
+                                Text(reason)
+                                    .font(.caption2)
+                                    .foregroundStyle(.blue)
+                            }
                             if suggestion.requiresClarification {
                                 VStack(alignment: .leading, spacing: 5) {
                                     ForEach(suggestion.alternativeTexts, id: \.self) { alternative in
@@ -209,9 +214,13 @@ struct FloatingSuggestionView: View {
                                         }
                                         .buttonStyle(.bordered)
                                     }
-                                    Button("Ignore") { model.ignore(suggestion) }
-                                        .buttonStyle(.plain)
-                                        .foregroundStyle(.secondary)
+                                    HStack {
+                                        Button("Reject") { model.reject(suggestion) }
+                                            .buttonStyle(.bordered)
+                                        Button("Ignore") { model.ignore(suggestion) }
+                                            .buttonStyle(.plain)
+                                            .foregroundStyle(.secondary)
+                                    }
                                 }
                                 .font(.caption)
                             } else {
@@ -226,6 +235,8 @@ struct FloatingSuggestionView: View {
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
                                     }
+                                    Button("Reject") { model.reject(suggestion) }
+                                        .buttonStyle(.bordered)
                                     Button("Ignore") { model.ignore(suggestion) }
                                         .buttonStyle(.plain)
                                         .foregroundStyle(.secondary)

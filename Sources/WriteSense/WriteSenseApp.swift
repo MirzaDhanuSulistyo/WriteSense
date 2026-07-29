@@ -71,6 +71,10 @@ struct MenuView: View {
 
             StatusCard()
 
+            if !model.onboardingCompleted {
+                OnboardingCard()
+            }
+
             if !model.permissionTrusted {
                 PermissionCard()
             }
@@ -88,6 +92,7 @@ struct MenuView: View {
                 }
             }
             .toggleStyle(.switch)
+            .disabled(!model.storageAvailable)
 
             VStack(spacing: 8) {
                 Button {
@@ -262,6 +267,38 @@ struct PermissionCard: View {
     }
 }
 
+struct OnboardingCard: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Label("Private by design", systemImage: "hand.raised.fill")
+                .font(.subheadline.weight(.semibold))
+            Text("WriteSense reads paragraph snapshots only in apps you approve. It blocks secure fields, never records raw keystrokes, and encrypts learned data with a key stored in your Mac’s Keychain.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            HStack(spacing: 6) {
+                Text("I send it yesterday")
+                    .strikethrough()
+                Image(systemName: "arrow.right")
+                Text("I sent it yesterday")
+                    .fontWeight(.semibold)
+            }
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            Text("After repeated edits, WriteSense can prioritize similar tense corrections and explain why.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Button("I understand") {
+                model.completeOnboarding()
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .padding(12)
+        .background(.blue.opacity(0.09), in: RoundedRectangle(cornerRadius: 10))
+    }
+}
+
 struct SuggestionCard: View {
     @EnvironmentObject private var model: AppModel
     let suggestion: Suggestion
@@ -372,6 +409,7 @@ struct SuggestionCard: View {
 struct SettingsView: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.openWindow) private var openWindow
+    @State private var confirmDeleteAll = false
 
     var body: some View {
         Form {
@@ -387,6 +425,11 @@ struct SettingsView: View {
                     get: { model.isLearningActive },
                     set: { model.setLearningActive($0) }
                 ))
+                .disabled(!model.storageAvailable)
+                if !model.storageAvailable {
+                    Label("Encrypted storage unavailable", systemImage: "externaldrive.badge.exclamationmark")
+                        .foregroundStyle(.red)
+                }
             } header: {
                 Text("Privacy status")
             } footer: {
@@ -418,10 +461,18 @@ struct SettingsView: View {
                     get: { model.capitalizationChecksEnabled },
                     set: { model.setCapitalizationChecksEnabled($0) }
                 ))
+                Picker("Writing preference", selection: Binding(
+                    get: { model.tonePreference },
+                    set: { model.setTonePreference($0) }
+                )) {
+                    ForEach(TonePreference.allCases) { preference in
+                        Text(preference.title).tag(preference)
+                    }
+                }
             } header: {
                 Text("Writing checks")
             } footer: {
-                Text("Turn this off to suppress suggestions that only capitalize the beginning of a sentence.")
+                Text("Writing preference affects ranking while preserving your meaning and personal vocabulary.")
             }
 
             Section("Approved applications") {
@@ -444,6 +495,19 @@ struct SettingsView: View {
                         }
                     }
                 }
+                if !model.customApprovedApplications.isEmpty {
+                    Divider()
+                    ForEach(model.customApprovedApplications) { application in
+                        HStack {
+                            Label(application.name, systemImage: "app.badge.checkmark")
+                            Spacer()
+                            Button("Remove", role: .destructive) {
+                                model.removeCustomApplication(application)
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                }
                 Button {
                     model.addFrontmostApplication()
                 } label: {
@@ -455,18 +519,49 @@ struct SettingsView: View {
                 LabeledContent("Reliable patterns", value: "\(model.reliablePatternCount)")
                 LabeledContent("Vocabulary entries", value: "\(model.profile.vocabulary.count)")
                 LabeledContent("Suggestions accepted", value: "\(model.profile.acceptedSuggestionCount)")
+                LabeledContent("Suggestions rejected", value: "\(model.profile.rejectedSuggestionCount)")
                 Button("Open writing insights") {
                     openWindow(id: "insights")
                 }
+                Button("Reset personalization", role: .destructive) {
+                    model.resetPersonalization()
+                }
             }
 
-            Section("Data controls") {
-                Button("Delete temporary data") {
+            Section {
+                Picker("Activity retention", selection: Binding(
+                    get: { model.historyRetentionDays },
+                    set: { model.setHistoryRetentionDays($0) }
+                )) {
+                    ForEach(AppModel.retentionOptions, id: \.self) { days in
+                        Text(days == 0 ? "Do not retain" : "\(days) days").tag(days)
+                    }
+                }
+                Button {
+                    model.exportWritingData()
+                } label: {
+                    Label("Export writing data", systemImage: "square.and.arrow.up")
+                }
+                Button("Delete today's activity") {
                     model.deleteTodayData()
                 }
-                Button("Delete all learned data", role: .destructive) {
-                    model.deleteAllData()
+                Menu {
+                    ForEach(model.applicationsWithStoredData) { application in
+                        Button(application.name, role: .destructive) {
+                            model.deleteData(for: application)
+                        }
+                    }
+                } label: {
+                    Label("Delete data for an application", systemImage: "app.badge.minus")
                 }
+                .disabled(model.applicationsWithStoredData.isEmpty)
+                Button("Delete all data and preferences", role: .destructive) {
+                    confirmDeleteAll = true
+                }
+            } header: {
+                Text("Data controls")
+            } footer: {
+                Text("Profiles and activity are encrypted locally. An exported JSON file is plaintext so you can inspect and move it.")
             }
         }
         .formStyle(.grouped)
@@ -476,15 +571,28 @@ struct SettingsView: View {
             model.refreshPermission()
             model.refreshOnDeviceModelStatus()
         }
+        .alert("Delete all WriteSense data?", isPresented: $confirmDeleteAll) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete Everything", role: .destructive) {
+                model.deleteAllData()
+            }
+        } message: {
+            Text("This removes learned patterns, examples, vocabulary, activity, application approvals, preferences, and the local encryption key. This cannot be undone.")
+        }
     }
 }
 
 struct InsightsView: View {
     @EnvironmentObject private var model: AppModel
+    @State private var vocabularyWord = ""
+
+    private let metricColumns = [
+        GridItem(.adaptive(minimum: 125), spacing: 10)
+    ]
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 22) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Writing insights")
                         .font(.largeTitle.weight(.bold))
@@ -492,11 +600,30 @@ struct InsightsView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                HStack(spacing: 10) {
+                LazyVGrid(columns: metricColumns, spacing: 10) {
                     InsightMetric(title: "Reliable patterns", value: "\(model.reliablePatternCount)", icon: "brain.head.profile")
                     InsightMetric(title: "Accepted", value: "\(model.profile.acceptedSuggestionCount)", icon: "checkmark.circle")
-                    InsightMetric(title: "Vocabulary", value: "\(model.profile.vocabulary.count)", icon: "character.book.closed")
+                    InsightMetric(title: "Rejected", value: "\(model.profile.rejectedSuggestionCount)", icon: "xmark.circle")
+                    InsightMetric(title: "Corrections · 7d", value: "\(model.currentWeekCorrectionCount)", icon: "pencil.and.list.clipboard")
+                    InsightMetric(
+                        title: "Acceptance · 7d",
+                        value: "\(Int(model.currentWeekAcceptanceRate * 100))%",
+                        icon: "chart.line.uptrend.xyaxis"
+                    )
                 }
+
+                VStack(alignment: .leading, spacing: 7) {
+                    Label("Improvement trend", systemImage: "chart.xyaxis.line")
+                        .font(.title3.weight(.semibold))
+                    Text(model.improvementTrendDescription)
+                        .foregroundStyle(.secondary)
+                    Text("Trends use retained activity metadata and never diagnostic logs or cloud analytics.")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(14)
+                .background(.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 11))
 
                 if model.learnedPatterns.isEmpty {
                     ContentUnavailableView(
@@ -504,7 +631,7 @@ struct InsightsView: View {
                         systemImage: "wand.and.stars",
                         description: Text("Make a few edits in an approved app. Repeated changes will appear here as patterns.")
                     )
-                    .frame(maxWidth: .infinity, minHeight: 240)
+                    .frame(maxWidth: .infinity, minHeight: 180)
                 } else {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Learned patterns")
@@ -514,10 +641,69 @@ struct InsightsView: View {
                         }
                     }
                 }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Personal vocabulary")
+                        .font(.title3.weight(.semibold))
+                    HStack {
+                        TextField("Name or technical term", text: $vocabularyWord)
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit { addVocabularyWord() }
+                        Button("Add") { addVocabularyWord() }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(vocabularyWord.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                    if model.visibleVocabulary.isEmpty {
+                        Text("Accepted terminology will not be flagged as a spelling issue.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(model.visibleVocabulary, id: \.self) { word in
+                            HStack {
+                                Text(word)
+                                Spacer()
+                                Button {
+                                    model.removeVocabularyWord(word)
+                                } label: {
+                                    Image(systemName: "trash")
+                                }
+                                .buttonStyle(.borderless)
+                                .foregroundStyle(.secondary)
+                                .help("Remove from vocabulary")
+                            }
+                            .padding(.vertical, 3)
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text("Recent correction events")
+                            .font(.title3.weight(.semibold))
+                        Spacer()
+                        Text(model.historyRetentionDays == 0 ? "Not retained" : "\(model.historyRetentionDays)-day retention")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if model.recentCorrectionEvents.isEmpty {
+                        Text("No retained correction events. Only changed fragments—not full paragraphs—are stored.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(model.recentCorrectionEvents) { event in
+                            CorrectionEventRow(event: event)
+                        }
+                    }
+                }
             }
             .padding(24)
         }
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    private func addVocabularyWord() {
+        model.addVocabularyWord(vocabularyWord)
+        vocabularyWord = ""
     }
 }
 
@@ -542,6 +728,45 @@ struct InsightMetric: View {
     }
 }
 
+struct CorrectionEventRow: View {
+    @EnvironmentObject private var model: AppModel
+    let event: CorrectionEvent
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 11) {
+            Image(systemName: "arrow.left.arrow.right.circle")
+                .foregroundStyle(.blue)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(event.category.title)
+                        .font(.subheadline.weight(.semibold))
+                    Text(event.applicationName)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Text("\(event.changedFragmentBefore.isEmpty ? "∅" : event.changedFragmentBefore)  →  \(event.changedFragmentAfter.isEmpty ? "∅" : event.changedFragmentAfter)")
+                    .font(.caption.monospaced())
+                    .lineLimit(2)
+                Text(event.createdAt, style: .relative)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer()
+            Button {
+                model.deleteCorrectionEvent(event)
+            } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .help("Delete this correction event")
+        }
+        .padding(11)
+        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 9))
+    }
+}
+
 struct PatternRow: View {
     @EnvironmentObject private var model: AppModel
     let pattern: LearnedPattern
@@ -559,12 +784,14 @@ struct PatternRow: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                Text(pattern.description)
+                Text(model.visibleDescription(for: pattern))
                     .font(.subheadline)
-                Text("\(pattern.exampleBefore)  →  \(pattern.exampleAfter)")
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                ForEach(Array(model.visibleExamples(for: pattern).prefix(3))) { example in
+                    Text("\(example.before.isEmpty ? "∅" : example.before)  →  \(example.after.isEmpty ? "∅" : example.after)")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
             }
             Spacer()
             Menu {

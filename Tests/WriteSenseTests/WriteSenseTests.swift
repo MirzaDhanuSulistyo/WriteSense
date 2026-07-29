@@ -56,6 +56,40 @@ final class WriteSenseTests: XCTestCase {
         XCTAssertTrue(settings.learningEnabled)
     }
 
+    func testLegacyProfileDecodesWithoutGeneralizationMetadata() throws {
+        let patternID = UUID()
+        let json = """
+        {
+          "patterns": [{
+            "id": "\(patternID.uuidString)",
+            "category": "verb_tense",
+            "description": "Legacy pattern",
+            "exampleBefore": "send",
+            "exampleAfter": "sent",
+            "occurrenceCount": 2,
+            "acceptanceCount": 0,
+            "rejectionCount": 0,
+            "confidence": 0.59,
+            "enabled": true,
+            "lastObservedAt": "2026-07-29T12:00:00Z",
+            "applicationBundleID": "com.apple.Notes"
+          }],
+          "vocabulary": [],
+          "acceptedSuggestionCount": 0,
+          "rejectedSuggestionCount": 0,
+          "updatedAt": "2026-07-29T12:00:00Z"
+        }
+        """
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let profile = try decoder.decode(WritingProfile.self, from: Data(json.utf8))
+
+        XCTAssertEqual(profile.patterns.first?.id, patternID)
+        XCTAssertNil(profile.patterns.first?.generalizedKey)
+        XCTAssertNil(profile.vocabularySources)
+        XCTAssertNil(profile.suggestionPreferences)
+    }
+
     func testAmbiguousIncompleteQuestionRequestsClarification() {
         let result = LocalLanguageEngine().analyze(
             "how do me",
@@ -177,6 +211,323 @@ final class WriteSenseTests: XCTestCase {
 
         XCTAssertEqual(profile.patterns.count, 1)
         XCTAssertTrue(profile.patterns[0].isReliable)
+    }
+
+    func testDiffProducesSeparateStructuredEdits() {
+        let diffs = TextDiffEngine().diffs(
+            before: "She have a apple and I send it yesterday.",
+            after: "She has an apple and I sent it yesterday."
+        )
+
+        XCTAssertEqual(diffs.map(\.before), ["have", "a", "send"])
+        XCTAssertEqual(diffs.map(\.after), ["has", "an", "sent"])
+        XCTAssertTrue(diffs.allSatisfy(\.isMeaningful))
+    }
+
+    func testDiffClassifiesWordOrderAndIgnoresWhitespaceOnlyChanges() {
+        let reordered = TextDiffEngine().diff(
+            before: "Please write clearly now.",
+            after: "Please clearly write now."
+        )
+        XCTAssertEqual(reordered.before, "write clearly")
+        XCTAssertEqual(reordered.after, "clearly write")
+        XCTAssertEqual(reordered.classification, .wordOrder)
+
+        let whitespace = TextDiffEngine().diffs(
+            before: "Hello  world.",
+            after: "Hello world."
+        )
+        XCTAssertTrue(whitespace.isEmpty)
+    }
+
+    func testInsertedArticleBecomesArticlePatternInsteadOfVocabulary() {
+        let diff = TextDiffEngine().diff(
+            before: "Please give example.",
+            after: "Please give an example."
+        )
+        XCTAssertEqual(diff.before, "")
+        XCTAssertEqual(diff.after, "an")
+        XCTAssertEqual(diff.classification, .insertion)
+
+        var profile = WritingProfile.empty
+        let event = PatternLearner().learn(
+            from: diff,
+            in: "Please give example.",
+            fullAfter: "Please give an example.",
+            profile: &profile,
+            applicationBundleID: "com.apple.Notes"
+        )
+        XCTAssertEqual(event?.category, .articleUsage)
+        XCTAssertTrue(profile.vocabulary.isEmpty)
+    }
+
+    func testGeneralizedTensePatternPersonalizesAnotherVerb() {
+        var profile = WritingProfile.empty
+        let learner = PatternLearner()
+        learner.learn(
+            from: CorrectionDiff(before: "send", after: "sent", isMeaningful: true),
+            in: "I send it yesterday.",
+            fullAfter: "I sent it yesterday.",
+            profile: &profile,
+            applicationBundleID: "com.apple.Notes"
+        )
+        learner.learn(
+            from: CorrectionDiff(before: "go", after: "went", isMeaningful: true),
+            in: "I go yesterday.",
+            fullAfter: "I went yesterday.",
+            profile: &profile,
+            applicationBundleID: "com.apple.Notes"
+        )
+
+        XCTAssertEqual(profile.patterns.count, 1)
+        XCTAssertTrue(profile.patterns[0].isReliable)
+        XCTAssertEqual(profile.patterns[0].allExamples.count, 2)
+
+        let suggestion = Suggestion(
+            originalText: "write",
+            suggestedText: "wrote",
+            category: .verbTense,
+            explanation: "Use past tense.",
+            confidence: 0.8,
+            range: TextRange(location: 2, length: 5)
+        )
+        let inNotes = PersonalizationEngine().rank(
+            [suggestion],
+            using: profile,
+            applicationBundleID: "com.apple.Notes"
+        )
+        XCTAssertTrue(inNotes[0].isPersonalized)
+        XCTAssertEqual(inNotes[0].patternID, profile.patterns[0].id)
+
+        let inSafari = PersonalizationEngine().rank(
+            [suggestion],
+            using: profile,
+            applicationBundleID: "com.apple.Safari"
+        )
+        XCTAssertFalse(inSafari[0].isPersonalized, "Single-app patterns should stay scoped to that app")
+    }
+
+    func testRepeatedGenericRejectionsAreSuppressedPerApplication() {
+        var profile = WritingProfile.empty
+        let learner = PatternLearner()
+        let suggestion = Suggestion(
+            originalText: "have",
+            suggestedText: "has",
+            category: .agreement,
+            explanation: "Match the singular subject.",
+            confidence: 0.85,
+            range: TextRange(location: 4, length: 4)
+        )
+
+        for _ in 0..<3 {
+            learner.record(
+                outcome: .rejected,
+                for: suggestion,
+                profile: &profile,
+                applicationBundleID: "com.apple.Notes"
+            )
+        }
+
+        XCTAssertTrue(PersonalizationEngine().rank(
+            [suggestion],
+            using: profile,
+            applicationBundleID: "com.apple.Notes"
+        ).isEmpty)
+        XCTAssertEqual(PersonalizationEngine().rank(
+            [suggestion],
+            using: profile,
+            applicationBundleID: "com.apple.Mail"
+        ).count, 1)
+    }
+
+    func testLargeRewritesAreNotRetainedAsPatterns() {
+        var profile = WritingProfile.empty
+        let longText = String(repeating: "sensitive ", count: 40)
+        let event = PatternLearner().learn(
+            from: CorrectionDiff(before: "", after: longText, isMeaningful: true, classification: .insertion),
+            in: "",
+            fullAfter: longText,
+            profile: &profile,
+            applicationBundleID: "com.apple.Notes"
+        )
+
+        XCTAssertNil(event)
+        XCTAssertTrue(profile.patterns.isEmpty)
+    }
+
+    func testLearningReturnsMinimalCorrectionEvent() {
+        var profile = WritingProfile.empty
+        let sessionID = UUID()
+        let event = PatternLearner().learn(
+            from: CorrectionDiff(
+                before: "have",
+                after: "has",
+                isMeaningful: true,
+                classification: .replacement
+            ),
+            in: "She have an answer.",
+            fullAfter: "She has an answer.",
+            profile: &profile,
+            applicationBundleID: "com.apple.Notes",
+            applicationName: "Notes",
+            sessionID: sessionID
+        )
+
+        XCTAssertEqual(event?.sessionID, sessionID)
+        XCTAssertEqual(event?.changedFragmentBefore, "have")
+        XCTAssertEqual(event?.changedFragmentAfter, "has")
+        XCTAssertEqual(event?.classification, .grammar)
+        XCTAssertEqual(event?.category, .agreement)
+        XCTAssertNotNil(event?.patternID)
+    }
+
+    func testHistoryRetentionPrunesTextBearingAndMetadataEvents() {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriteSenseRetention-\(UUID().uuidString)")
+        let service = "com.writesense.tests.\(UUID().uuidString)"
+        let store = ProfileStore(directoryURL: directory, keychainService: service)
+        defer { store.deleteAllData() }
+
+        let now = Date()
+        let old = Calendar.current.date(byAdding: .day, value: -31, to: now)!
+        let recent = Calendar.current.date(byAdding: .day, value: -2, to: now)!
+        let history = WritingHistory(
+            correctionEvents: [
+                correctionEvent(at: old),
+                correctionEvent(at: recent)
+            ],
+            suggestionEvents: [
+                SuggestionFeedbackEvent(
+                    category: .agreement,
+                    outcome: .accepted,
+                    wasPersonalized: true,
+                    patternID: nil,
+                    applicationBundleID: "com.apple.Notes",
+                    createdAt: old
+                ),
+                SuggestionFeedbackEvent(
+                    category: .agreement,
+                    outcome: .rejected,
+                    wasPersonalized: false,
+                    patternID: nil,
+                    applicationBundleID: "com.apple.Notes",
+                    createdAt: recent
+                )
+            ],
+            editingSessions: [
+                EditingSessionRecord(
+                    id: UUID(),
+                    applicationName: "Notes",
+                    applicationBundleID: "com.apple.Notes",
+                    startedAt: old,
+                    lastUpdatedAt: old
+                ),
+                EditingSessionRecord(
+                    id: UUID(),
+                    applicationName: "Notes",
+                    applicationBundleID: "com.apple.Notes",
+                    startedAt: recent,
+                    lastUpdatedAt: recent
+                )
+            ],
+            privacyAuditEvents: [
+                PrivacyAuditEvent(action: .learningEnabled, createdAt: old),
+                PrivacyAuditEvent(action: .learningDisabled, createdAt: recent)
+            ]
+        )
+
+        let pruned = store.pruned(history: history, retentionDays: 30, now: now)
+        XCTAssertEqual(pruned.correctionEvents.map(\.createdAt), [recent])
+        XCTAssertEqual(pruned.suggestionEvents.map(\.createdAt), [recent])
+        XCTAssertEqual(pruned.editingSessions?.map(\.lastUpdatedAt), [recent])
+        XCTAssertEqual(pruned.privacyAuditEvents?.map(\.createdAt), [recent])
+        XCTAssertEqual(store.pruned(history: history, retentionDays: 0), .empty)
+    }
+
+    func testPlaintextPrototypeProfileMigratesToEncryptedStorage() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriteSenseMigration-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let service = "com.writesense.tests.\(UUID().uuidString)"
+        let legacyURL = directory.appendingPathComponent("writing-profile.json")
+        var legacyProfile = WritingProfile.empty
+        legacyProfile.vocabulary.insert("legacyterm")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(legacyProfile).write(to: legacyURL)
+
+        let store = ProfileStore(directoryURL: directory, keychainService: service)
+        defer { store.deleteAllData() }
+        let migrated = store.loadProfile()
+
+        XCTAssertEqual(migrated.vocabulary, Set(["legacyterm"]))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacyURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent("writing-profile.enc").path
+        ))
+    }
+
+    func testUnreadableEncryptedStorageFailsClosedUntilDeletion() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriteSenseCorrupt-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("not-an-aes-envelope".utf8).write(
+            to: directory.appendingPathComponent("writing-profile.enc")
+        )
+        let store = ProfileStore(
+            directoryURL: directory,
+            keychainService: "com.writesense.tests.\(UUID().uuidString)"
+        )
+
+        XCTAssertTrue(store.loadProfile().patterns.isEmpty)
+        XCTAssertTrue(store.hasLoadFailure)
+        XCTAssertFalse(store.save(profile: .empty), "Unreadable data must not be overwritten silently")
+        XCTAssertTrue(store.deleteAllData())
+        XCTAssertFalse(store.hasLoadFailure)
+    }
+
+    func testProfileStoreEncryptsRoundTripsExportsAndDeletes() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriteSenseEncryption-\(UUID().uuidString)")
+        let service = "com.writesense.tests.\(UUID().uuidString)"
+        let store = ProfileStore(directoryURL: directory, keychainService: service)
+        defer { store.deleteAllData() }
+
+        var profile = WritingProfile.empty
+        profile.vocabulary.insert("confidentialterm")
+        XCTAssertTrue(store.save(profile: profile))
+
+        let encryptedURL = directory.appendingPathComponent("writing-profile.enc")
+        let ciphertext = try Data(contentsOf: encryptedURL)
+        XCTAssertNil(ciphertext.range(of: Data("confidentialterm".utf8)))
+        XCTAssertEqual(store.loadProfile().vocabulary, Set(["confidentialterm"]))
+
+        let exportData = try store.exportData(
+            profile: profile,
+            history: .empty,
+            settings: .defaults
+        )
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let export = try decoder.decode(WriteSenseExport.self, from: exportData)
+        XCTAssertEqual(export.formatVersion, 1)
+        XCTAssertEqual(export.profile.vocabulary, Set(["confidentialterm"]))
+
+        XCTAssertTrue(store.deleteAllData())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    private func correctionEvent(at date: Date) -> CorrectionEvent {
+        CorrectionEvent(
+            sessionID: UUID(),
+            applicationName: "Notes",
+            applicationBundleID: "com.apple.Notes",
+            changedFragmentBefore: "have",
+            changedFragmentAfter: "has",
+            classification: .grammar,
+            category: .agreement,
+            createdAt: date
+        )
     }
 
     private func applying(_ suggestions: [Suggestion], to text: String) -> String {

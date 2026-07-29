@@ -15,7 +15,8 @@ final class LocalLanguageEngine {
         _ text: String,
         profile: WritingProfile,
         applicationBundleID: String? = nil,
-        includeCapitalization: Bool = true
+        includeCapitalization: Bool = true,
+        tonePreference: TonePreference = .preserveVoice
     ) -> LanguageAnalysis {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return LanguageAnalysis(language: "Unknown", suggestions: [])
@@ -48,7 +49,12 @@ final class LocalLanguageEngine {
                 return suggestion.originalText.contains(",") || suggestion.suggestedText == "?"
             }
         }
-        let personalized = PersonalizationEngine().rank(unique, using: profile)
+        let personalized = PersonalizationEngine().rank(
+            unique,
+            using: profile,
+            applicationBundleID: applicationBundleID,
+            tonePreference: tonePreference
+        )
         return LanguageAnalysis(language: language, suggestions: personalized)
     }
 
@@ -701,24 +707,108 @@ final class LocalLanguageEngine {
 }
 
 final class PersonalizationEngine {
-    func rank(_ suggestions: [Suggestion], using profile: WritingProfile) -> [Suggestion] {
+    func rank(
+        _ suggestions: [Suggestion],
+        using profile: WritingProfile,
+        applicationBundleID: String? = nil,
+        tonePreference: TonePreference = .preserveVoice
+    ) -> [Suggestion] {
         let ranked = suggestions.compactMap { suggestion -> Suggestion? in
             var copy = suggestion
-            let matches = profile.patterns.filter { pattern in
-                pattern.isReliable && pattern.category == suggestion.category &&
-                (normalized(pattern.exampleBefore) == normalized(suggestion.originalText) ||
-                 normalized(pattern.exampleAfter) == normalized(suggestion.suggestedText))
+            let suggestionKey = PatternGeneralizer.key(
+                category: suggestion.category,
+                before: suggestion.originalText,
+                after: suggestion.suggestedText
+            )
+
+            let candidates = profile.patterns.compactMap { pattern -> (LearnedPattern, Double)? in
+                guard pattern.isReliable, pattern.category == suggestion.category else { return nil }
+
+                let exactBefore = PatternGeneralizer.normalized(pattern.exampleBefore) ==
+                    PatternGeneralizer.normalized(suggestion.originalText)
+                let exactAfter = PatternGeneralizer.normalized(pattern.exampleAfter) ==
+                    PatternGeneralizer.normalized(suggestion.suggestedText)
+                let patternKey = pattern.generalizedKey ?? PatternGeneralizer.key(
+                    category: pattern.category,
+                    before: pattern.exampleBefore,
+                    after: pattern.exampleAfter
+                )
+                let generalizedMatch = patternKey == suggestionKey
+                guard exactBefore || exactAfter || generalizedMatch else { return nil }
+
+                // A pattern observed in only one application remains scoped to
+                // that application unless the exact correction is repeated.
+                if let scopedApp = pattern.applicationBundleID,
+                   scopedApp != applicationBundleID,
+                   !(exactBefore && exactAfter) {
+                    return nil
+                }
+
+                var score = pattern.confidence
+                if exactBefore && exactAfter { score += 0.5 }
+                else if generalizedMatch { score += 0.28 }
+                if pattern.applicationBundleID == applicationBundleID { score += 0.12 }
+                return (pattern, score)
             }
 
-            if let pattern = matches.max(by: { $0.confidence < $1.confidence }) {
+            if let pattern = candidates.max(by: { $0.1 < $1.1 })?.0 {
                 copy.isPersonalized = true
                 copy.patternID = pattern.id
-                copy.confidence = min(0.99, suggestion.confidence + pattern.confidence * 0.15)
-                copy.personalizationReason = "You made a similar correction \(pattern.occurrenceCount) times."
+                var boost = pattern.confidence * 0.15
+                if pattern.applicationBundleID == applicationBundleID { boost += 0.03 }
+                copy.confidence = min(0.99, suggestion.confidence + boost)
+                let appPhrase = pattern.applicationBundleID == applicationBundleID
+                    ? " in this application"
+                    : ""
+                copy.personalizationReason = "You made this kind of correction \(pattern.occurrenceCount) times\(appPhrase)."
             }
 
-            let related = profile.patterns.filter { $0.category == suggestion.category && $0.rejectionCount >= 3 && $0.rejectionCount > $0.acceptanceCount }
-            if !copy.isPersonalized && !related.isEmpty { return nil }
+            let matchingPreferences = (profile.suggestionPreferences ?? []).filter { preference in
+                preference.generalizedKey == suggestionKey &&
+                    preference.category == suggestion.category &&
+                    (preference.applicationBundleID == nil || preference.applicationBundleID == applicationBundleID)
+            }
+            if matchingPreferences.contains(where: {
+                $0.rejectionCount >= 3 && $0.rejectionCount > $0.acceptanceCount
+            }) {
+                return nil
+            }
+            if !copy.isPersonalized,
+               let acceptedPreference = matchingPreferences.max(by: {
+                   $0.acceptanceCount < $1.acceptanceCount
+               }),
+               acceptedPreference.acceptanceCount >= 2,
+               acceptedPreference.acceptanceCount > acceptedPreference.rejectionCount {
+                copy.isPersonalized = true
+                copy.confidence = min(0.99, copy.confidence + 0.06)
+                copy.personalizationReason = "You accepted this kind of suggestion \(acceptedPreference.acceptanceCount) times."
+            }
+
+            let stronglyRejectedPattern = profile.patterns.contains { pattern in
+                guard pattern.enabled,
+                      pattern.category == suggestion.category,
+                      pattern.rejectionCount >= 3,
+                      pattern.rejectionCount > pattern.acceptanceCount else { return false }
+                let patternKey = pattern.generalizedKey ?? PatternGeneralizer.key(
+                    category: pattern.category,
+                    before: pattern.exampleBefore,
+                    after: pattern.exampleAfter
+                )
+                let appMatches = pattern.applicationBundleID == nil || pattern.applicationBundleID == applicationBundleID
+                return patternKey == suggestionKey && appMatches
+            }
+            if stronglyRejectedPattern { return nil }
+
+            switch tonePreference {
+            case .concise where copy.category == .concision:
+                copy.confidence = min(0.99, copy.confidence + 0.08)
+            case .preserveVoice where copy.category == .style && copy.confidence < 0.86:
+                return nil
+            case .formal where copy.category == .style:
+                copy.confidence = min(0.99, copy.confidence + 0.04)
+            default:
+                break
+            }
             return copy
         }
 
@@ -727,62 +817,214 @@ final class PersonalizationEngine {
             return $0.confidence > $1.confidence
         }
     }
-
-    private func normalized(_ value: String) -> String {
-        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-    }
 }
 
 struct TextDiffEngine {
+    private struct Token {
+        let value: String
+        let range: NSRange
+    }
+
     func diff(before: String, after: String) -> CorrectionDiff {
-        let old = Array(before)
-        let new = Array(after)
-        guard old != new else { return CorrectionDiff(before: "", after: "", isMeaningful: false) }
-
-        var prefix = 0
-        while prefix < old.count && prefix < new.count && old[prefix] == new[prefix] { prefix += 1 }
-        var suffix = 0
-        while suffix < old.count - prefix && suffix < new.count - prefix &&
-                old[old.count - suffix - 1] == new[new.count - suffix - 1] {
-            suffix += 1
-        }
-
-        var oldStart = prefix
-        var newStart = prefix
-        var oldEnd = old.count - suffix
-        var newEnd = new.count - suffix
-
-        // Expand a partial word replacement to the complete word. A character-
-        // level diff of “send” → “sent” is technically “d” → “t”, but the
-        // useful learning event is the whole word.
-        let changeStartsInsideWord = (oldStart < old.count && isWordCharacter(old[oldStart])) ||
-            (newStart < new.count && isWordCharacter(new[newStart]))
-        if changeStartsInsideWord {
-            while oldStart > 0 && isWordCharacter(old[oldStart - 1]) { oldStart -= 1 }
-            while newStart > 0 && isWordCharacter(new[newStart - 1]) { newStart -= 1 }
-            while oldEnd < old.count && isWordCharacter(old[oldEnd]) { oldEnd += 1 }
-            while newEnd < new.count && isWordCharacter(new[newEnd]) { newEnd += 1 }
-        }
-
-        let beforeFragment = oldStart < oldEnd ? String(old[oldStart..<oldEnd]) : ""
-        let afterFragment = newStart < newEnd ? String(new[newStart..<newEnd]) : ""
-        let normalizedBefore = normalize(beforeFragment)
-        let normalizedAfter = normalize(afterFragment)
-        return CorrectionDiff(
-            before: beforeFragment,
-            after: afterFragment,
-            isMeaningful: normalizedBefore != normalizedAfter &&
-                (!beforeFragment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                 !afterFragment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        diffs(before: before, after: after).first ?? CorrectionDiff(
+            before: "",
+            after: "",
+            isMeaningful: false
         )
+    }
+
+    /// Produces one event for each non-overlapping token-level edit. Whitespace
+    /// is intentionally excluded so formatting-only changes do not become
+    /// personal writing patterns.
+    func diffs(before: String, after: String) -> [CorrectionDiff] {
+        guard before != after else { return [] }
+        let oldTokens = tokenize(before)
+        let newTokens = tokenize(after)
+
+        let oldValues = oldTokens.map(\.value)
+        let newValues = newTokens.map(\.value)
+        if oldValues == newValues { return [] }
+
+        let oldWords = oldValues.map { $0.lowercased() }
+        let newWords = newValues.map { $0.lowercased() }
+        if oldWords.count > 1,
+           oldWords.count == newWords.count,
+           oldWords.sorted() == newWords.sorted(),
+           oldWords != newWords {
+            var prefix = 0
+            while prefix < oldWords.count && oldWords[prefix] == newWords[prefix] { prefix += 1 }
+            var suffix = 0
+            while suffix < oldWords.count - prefix &&
+                    oldWords[oldWords.count - suffix - 1] == newWords[newWords.count - suffix - 1] {
+                suffix += 1
+            }
+            let oldFragment = fragment(
+                from: oldTokens,
+                start: prefix,
+                end: oldTokens.count - suffix,
+                source: before
+            )
+            let newFragment = fragment(
+                from: newTokens,
+                start: prefix,
+                end: newTokens.count - suffix,
+                source: after
+            )
+            return [CorrectionDiff(
+                before: oldFragment,
+                after: newFragment,
+                isMeaningful: true,
+                classification: .wordOrder
+            )]
+        }
+
+        if oldTokens.isEmpty || newTokens.isEmpty {
+            let oldValue = before.trimmingCharacters(in: .whitespacesAndNewlines)
+            let newValue = after.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !oldValue.isEmpty || !newValue.isEmpty else { return [] }
+            return [CorrectionDiff(
+                before: oldValue,
+                after: newValue,
+                isMeaningful: true,
+                classification: classify(before: oldValue, after: newValue)
+            )]
+        }
+
+        let matches = lcsMatches(oldTokens.map(\.value), newTokens.map(\.value)) + [(oldTokens.count, newTokens.count)]
+        var oldCursor = 0
+        var newCursor = 0
+        var results: [CorrectionDiff] = []
+
+        for (oldMatch, newMatch) in matches {
+            if oldCursor < oldMatch || newCursor < newMatch {
+                let oldCount = oldMatch - oldCursor
+                let newCount = newMatch - newCursor
+                if oldCount == newCount && oldCount > 1 {
+                    // Adjacent one-for-one replacements such as “have a” →
+                    // “has an” are separate reusable corrections.
+                    for offset in 0..<oldCount {
+                        let oldFragment = oldTokens[oldCursor + offset].value
+                        let newFragment = newTokens[newCursor + offset].value
+                        if normalize(oldFragment) != normalize(newFragment) {
+                            results.append(CorrectionDiff(
+                                before: oldFragment,
+                                after: newFragment,
+                                isMeaningful: true,
+                                classification: classify(before: oldFragment, after: newFragment)
+                            ))
+                        }
+                    }
+                } else {
+                    let oldFragment = fragment(from: oldTokens, start: oldCursor, end: oldMatch, source: before)
+                    let newFragment = fragment(from: newTokens, start: newCursor, end: newMatch, source: after)
+                    let normalizedBefore = normalize(oldFragment)
+                    let normalizedAfter = normalize(newFragment)
+                    if normalizedBefore != normalizedAfter && (!normalizedBefore.isEmpty || !normalizedAfter.isEmpty) {
+                        results.append(CorrectionDiff(
+                            before: oldFragment,
+                            after: newFragment,
+                            isMeaningful: true,
+                            classification: classify(before: oldFragment, after: newFragment)
+                        ))
+                    }
+                }
+            }
+            oldCursor = oldMatch + 1
+            newCursor = newMatch + 1
+        }
+        return results
+    }
+
+    private func tokenize(_ text: String) -> [Token] {
+        let source = text as NSString
+        let regex = try! NSRegularExpression(
+            pattern: #"[\p{L}\p{N}]+(?:['’\-][\p{L}\p{N}]+)*|[^\s\p{L}\p{N}]"#
+        )
+        return regex.matches(in: text, range: NSRange(location: 0, length: source.length)).map {
+            Token(value: source.substring(with: $0.range), range: $0.range)
+        }
+    }
+
+    private func lcsMatches(_ old: [String], _ new: [String]) -> [(Int, Int)] {
+        var lengths = Array(
+            repeating: Array(repeating: 0, count: new.count + 1),
+            count: old.count + 1
+        )
+        if !old.isEmpty && !new.isEmpty {
+            for i in stride(from: old.count - 1, through: 0, by: -1) {
+                for j in stride(from: new.count - 1, through: 0, by: -1) {
+                    if old[i] == new[j] {
+                        lengths[i][j] = lengths[i + 1][j + 1] + 1
+                    } else {
+                        lengths[i][j] = max(lengths[i + 1][j], lengths[i][j + 1])
+                    }
+                }
+            }
+        }
+
+        var i = 0
+        var j = 0
+        var matches: [(Int, Int)] = []
+        while i < old.count && j < new.count {
+            if old[i] == new[j] {
+                matches.append((i, j))
+                i += 1
+                j += 1
+            } else if lengths[i + 1][j] >= lengths[i][j + 1] {
+                i += 1
+            } else {
+                j += 1
+            }
+        }
+        return matches
+    }
+
+    private func fragment(from tokens: [Token], start: Int, end: Int, source: String) -> String {
+        guard start < end, start < tokens.count else { return "" }
+        let last = min(end - 1, tokens.count - 1)
+        let range = NSRange(
+            location: tokens[start].range.location,
+            length: NSMaxRange(tokens[last].range) - tokens[start].range.location
+        )
+        return (source as NSString).substring(with: range)
+    }
+
+    private func classify(before: String, after: String) -> EditClassification {
+        let before = normalize(before)
+        let after = normalize(after)
+        if before.isEmpty { return .insertion }
+        if after.isEmpty { return .deletion }
+        if before.lowercased() == after.lowercased() && before != after { return .capitalization }
+
+        let oldWords = wordTokens(before)
+        let newWords = wordTokens(after)
+        if oldWords.count > 1,
+           oldWords.count == newWords.count,
+           oldWords.sorted() == newWords.sorted(),
+           oldWords != newWords {
+            return .wordOrder
+        }
+        if punctuationAndWhitespaceOnly(before) || punctuationAndWhitespaceOnly(after) {
+            return .punctuation
+        }
+        return .replacement
+    }
+
+    private func wordTokens(_ value: String) -> [String] {
+        value.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init)
+    }
+
+    private func punctuationAndWhitespaceOnly(_ value: String) -> Bool {
+        guard !value.isEmpty else { return false }
+        return value.unicodeScalars.allSatisfy {
+            CharacterSet.punctuationCharacters.contains($0) ||
+                CharacterSet.symbols.contains($0) ||
+                CharacterSet.whitespacesAndNewlines.contains($0)
+        }
     }
 
     private func normalize(_ value: String) -> String {
         value.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func isWordCharacter(_ character: Character) -> Bool {
-        character.isLetter || character.isNumber || character == "'"
     }
 }

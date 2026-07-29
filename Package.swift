@@ -12,7 +12,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "WriteSense",
-            path: "Sources/WriteSense"
+            path: "Sources/WriteSense",
+            linkerSettings: [
+                .linkedFramework("Security")
+            ]
         ),
         .testTarget(
             name: "WriteSenseTests",

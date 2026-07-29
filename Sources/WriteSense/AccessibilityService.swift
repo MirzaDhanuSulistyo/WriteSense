@@ -2,6 +2,28 @@ import AppKit
 import ApplicationServices
 import Foundation
 
+enum CaptureFailure: Error, Equatable {
+    case noApplication
+    case noFocusedElement
+    case secureField
+    case sensitiveContext
+    case unsupportedField
+    case unreadableText
+    case emptyText
+
+    var statusMessage: String {
+        switch self {
+        case .noApplication: return "No supported app detected"
+        case .noFocusedElement: return "No focused text field"
+        case .secureField: return "Secure field detected — blocked"
+        case .sensitiveContext: return "Private browsing detected — blocked"
+        case .unsupportedField: return "Unsupported text field"
+        case .unreadableText: return "Text field cannot be read safely"
+        case .emptyText: return "The current text field is empty"
+        }
+    }
+}
+
 final class AccessibilityService {
     struct Permission {
         static var isTrusted: Bool {
@@ -14,13 +36,28 @@ final class AccessibilityService {
         }
     }
 
-    func focusedParagraph(for application: NSRunningApplication? = NSWorkspace.shared.frontmostApplication) -> CapturedParagraph? {
+    func focusedParagraph(
+        for application: NSRunningApplication? = NSWorkspace.shared.frontmostApplication
+    ) -> CapturedParagraph? {
+        guard case .success(let paragraph) = focusedParagraphResult(for: application) else { return nil }
+        return paragraph
+    }
+
+    func focusedParagraphResult(
+        for application: NSRunningApplication? = NSWorkspace.shared.frontmostApplication
+    ) -> Result<CapturedParagraph, CaptureFailure> {
         guard let application,
               let bundleID = application.bundleIdentifier,
-              application.processIdentifier != 0 else { return nil }
+              application.processIdentifier != 0 else {
+            return .failure(.noApplication)
+        }
 
         let processIdentifier = application.processIdentifier
         let appElement = AXUIElementCreateApplication(processIdentifier)
+        if isPrivateBrowsingContext(bundleID: bundleID, appElement: appElement) {
+            return .failure(.sensitiveContext)
+        }
+
         var focusedValue: CFTypeRef?
         guard AXUIElementCopyAttributeValue(
             appElement,
@@ -28,23 +65,34 @@ final class AccessibilityService {
             &focusedValue
         ) == .success,
         let focusedValue,
-        CFGetTypeID(focusedValue) == AXUIElementGetTypeID() else { return nil }
+        CFGetTypeID(focusedValue) == AXUIElementGetTypeID() else {
+            return .failure(.noFocusedElement)
+        }
 
         let element = focusedValue as! AXUIElement
-        guard isSupportedTextElement(element), let text = stringAttribute(kAXValueAttribute, from: element) else {
-            return nil
+        if isSecureTextElement(element) { return .failure(.secureField) }
+        guard isSupportedTextElement(element) else { return .failure(.unsupportedField) }
+        guard let text = stringAttribute(kAXValueAttribute, from: element) else {
+            return .failure(.unreadableText)
         }
+
         // Terminal exposes the whole screen buffer. Only operate when it also
-        // exposes a cursor/selection range, so we can limit analysis and edits
-        // to the active command line.
+        // exposes a cursor/selection range, so analysis is limited to the
+        // active command line. Terminal remains suggestion/copy-only.
         if bundleID == "com.apple.Terminal" && selectedRange(from: element) == nil {
-            return nil
+            return .failure(.unsupportedField)
         }
-        guard !text.isEmpty, let range = paragraphRange(in: text, for: element) else { return nil }
+        guard !text.isEmpty else { return .failure(.emptyText) }
+        guard let range = paragraphRange(in: text, for: element) else {
+            return .failure(.unreadableText)
+        }
 
         let paragraph = (text as NSString).substring(with: range)
+        guard !paragraph.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .failure(.emptyText)
+        }
         let appName = application.localizedName ?? bundleID
-        return CapturedParagraph(
+        return .success(CapturedParagraph(
             applicationName: appName,
             applicationBundleID: bundleID,
             fullText: text,
@@ -52,7 +100,7 @@ final class AccessibilityService {
             paragraphRange: TextRange(location: range.location, length: range.length),
             element: element,
             elementFrame: frameAttribute(from: element)
-        )
+        ))
     }
 
     func replace(_ suggestion: Suggestion, with replacement: String, in captured: CapturedParagraph) -> Bool {
@@ -104,15 +152,16 @@ final class AccessibilityService {
         }
 
         // A previous accepted suggestion may have changed the length of the
-        // paragraph. Fall back to the matching text instead of using a stale
-        // range from the earlier review.
+        // paragraph. Fall back to the nearest matching text instead of using a
+        // stale range from the earlier review.
         var searchStart = 0
         var best = NSRange(location: NSNotFound, length: 0)
         while searchStart < string.length {
             let searchRange = NSRange(location: searchStart, length: string.length - searchStart)
             let found = string.range(of: expected, options: [], range: searchRange)
             guard found.location != NSNotFound else { break }
-            if best.location == NSNotFound || abs(found.location - preferred.location) < abs(best.location - preferred.location) {
+            if best.location == NSNotFound ||
+                abs(found.location - preferred.location) < abs(best.location - preferred.location) {
                 best = found
             }
             searchStart = found.location + max(found.length, 1)
@@ -120,18 +169,41 @@ final class AccessibilityService {
         return best
     }
 
+    private func isPrivateBrowsingContext(bundleID: String, appElement: AXUIElement) -> Bool {
+        let browserBundleIDs: Set<String> = ["com.apple.Safari", "com.google.Chrome"]
+        guard browserBundleIDs.contains(bundleID) else { return false }
+
+        var windowValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            appElement,
+            kAXFocusedWindowAttribute as CFString,
+            &windowValue
+        ) == .success,
+        let windowValue,
+        CFGetTypeID(windowValue) == AXUIElementGetTypeID() else { return false }
+
+        let window = windowValue as! AXUIElement
+        let title = stringAttribute(kAXTitleAttribute, from: window)?.lowercased() ?? ""
+        return title.contains("private browsing") ||
+            title.contains("private window") ||
+            title.contains("incognito")
+    }
+
+    private func isSecureTextElement(_ element: AXUIElement) -> Bool {
+        if let role = stringAttribute(kAXRoleAttribute, from: element), role == "AXSecureTextField" {
+            return true
+        }
+        if let subrole = stringAttribute(kAXSubroleAttribute, from: element),
+           subrole.localizedCaseInsensitiveContains("secure") ||
+            subrole.localizedCaseInsensitiveContains("password") {
+            return true
+        }
+        if let password = boolAttribute("AXIsPassword", from: element), password { return true }
+        return false
+    }
+
     private func isSupportedTextElement(_ element: AXUIElement) -> Bool {
         guard let role = stringAttribute(kAXRoleAttribute, from: element) else { return false }
-        let secureRoles = ["AXSecureTextField"]
-        if secureRoles.contains(role) { return false }
-
-        if let subrole = stringAttribute(kAXSubroleAttribute, from: element),
-           subrole.localizedCaseInsensitiveContains("secure") || subrole.localizedCaseInsensitiveContains("password") {
-            return false
-        }
-
-        if let password = boolAttribute("AXIsPassword", from: element), password { return false }
-
         let supportedRoles = [
             kAXTextFieldRole as String,
             kAXTextAreaRole as String,

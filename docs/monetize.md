@@ -83,31 +83,30 @@ Deep Review is useful, but it should not be the only paid benefit because it is 
 
 ## Work required before a public paid launch
 
-The current repository is a strong prototype, but several areas need production work before accepting payments broadly.
+The Phase 0–6 MVP now includes structured correction events, generalized and application-aware personalization, AES-GCM storage with a Keychain-backed key, configurable retention, export, per-application deletion, personalization reset, and complete deletion. The remaining work is production validation and Phase 7 hardening.
 
-### Privacy and security
+### Privacy and security validation
 
-- `Sources/WriteSense/ProfileStore.swift` currently stores correction examples in unencrypted JSON, while the PRD calls for encryption and Keychain-backed keys.
-- Implement full deletion of profile data, settings, preferences, and retained temporary records.
-- Add configurable retention and profile export.
-- Complete a privacy review and document exactly what is read, retained, and deleted.
+- Complete an independent privacy and security review of the implemented local data lifecycle.
+- Exercise secure-field and private-window blocking against real application releases.
+- Verify migration, retention, export, and cryptographic deletion on signed production builds.
+- Keep the published privacy and data architecture synchronized with implementation changes.
 
-### Personalization quality
+### Recommendation-quality validation
 
-- Current learning primarily groups and matches exact before/after phrases.
-- Improve pattern generalization so a correction learned in one sentence can help in a different sentence.
-- Build a representative evaluation set for generic and personalized suggestions.
-- Demonstrate a measurable acceptance-rate improvement from personalization.
+- Expand the evaluation corpus beyond deterministic regression cases.
+- Measure suggestion precision and undo rate using real, consented beta workflows.
+- Demonstrate that generalized personalized suggestions have a higher acceptance rate than generic suggestions.
+- Tune pattern confidence and rejection suppression from content-free beta metrics.
 
 ### Distribution and reliability
 
 - Notarize and package release builds.
 - Add a secure update mechanism.
 - Add trial and license management.
-- Test Accessibility behavior in Mail, Notes, TextEdit, Safari, and Chrome.
-- Publish a compatibility matrix and fail safely in unsupported editors.
+- Complete the manual compatibility matrix for Mail, Notes, TextEdit, Safari, and Chrome.
 - Add privacy-safe crash and product analytics with no raw text.
-- Improve first-run onboarding, including a sample learning interaction.
+- Expand first-run onboarding with a guided sample learning interaction.
 
 ## Team expansion
 
