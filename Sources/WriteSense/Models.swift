@@ -346,17 +346,26 @@ struct WritingHistory: Codable, Equatable {
     var suggestionEvents: [SuggestionFeedbackEvent]
     var editingSessions: [EditingSessionRecord]?
     var privacyAuditEvents: [PrivacyAuditEvent]?
+    var diagnosticEvents: [DiagnosticEvent]?
+    var compatibilityObservations: [CompatibilityObservation]?
+    var applicationRuns: [ApplicationRunRecord]?
 
     init(
         correctionEvents: [CorrectionEvent] = [],
         suggestionEvents: [SuggestionFeedbackEvent] = [],
         editingSessions: [EditingSessionRecord]? = nil,
-        privacyAuditEvents: [PrivacyAuditEvent]? = nil
+        privacyAuditEvents: [PrivacyAuditEvent]? = nil,
+        diagnosticEvents: [DiagnosticEvent]? = nil,
+        compatibilityObservations: [CompatibilityObservation]? = nil,
+        applicationRuns: [ApplicationRunRecord]? = nil
     ) {
         self.correctionEvents = correctionEvents
         self.suggestionEvents = suggestionEvents
         self.editingSessions = editingSessions
         self.privacyAuditEvents = privacyAuditEvents
+        self.diagnosticEvents = diagnosticEvents
+        self.compatibilityObservations = compatibilityObservations
+        self.applicationRuns = applicationRuns
     }
 
     static let empty = WritingHistory()
@@ -412,6 +421,7 @@ struct CapturedParagraph {
     let paragraphRange: TextRange
     let element: AXUIElement
     let elementFrame: CGRect?
+    let isWritable: Bool
 }
 
 struct CorrectionDiff: Equatable {

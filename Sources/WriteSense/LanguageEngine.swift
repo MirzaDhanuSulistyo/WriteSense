@@ -845,6 +845,14 @@ struct TextDiffEngine {
         let newValues = newTokens.map(\.value)
         if oldValues == newValues { return [] }
 
+        // Bound LCS memory for unusually long paragraphs. The linear fallback
+        // still produces a safe changed span; large spans are subsequently
+        // excluded from retained learning examples.
+        if !oldTokens.isEmpty,
+           newTokens.count > 250_000 / oldTokens.count {
+            return linearFallbackDiff(before: before, after: after)
+        }
+
         let oldWords = oldValues.map { $0.lowercased() }
         let newWords = newValues.map { $0.lowercased() }
         if oldWords.count > 1,
@@ -933,6 +941,35 @@ struct TextDiffEngine {
             newCursor = newMatch + 1
         }
         return results
+    }
+
+    private func linearFallbackDiff(before: String, after: String) -> [CorrectionDiff] {
+        let old = Array(before)
+        let new = Array(after)
+        var prefix = 0
+        while prefix < old.count && prefix < new.count && old[prefix] == new[prefix] {
+            prefix += 1
+        }
+        var suffix = 0
+        while suffix < old.count - prefix,
+              suffix < new.count - prefix,
+              old[old.count - suffix - 1] == new[new.count - suffix - 1] {
+            suffix += 1
+        }
+        let oldEnd = old.count - suffix
+        let newEnd = new.count - suffix
+        let oldFragment = prefix < oldEnd ? String(old[prefix..<oldEnd]) : ""
+        let newFragment = prefix < newEnd ? String(new[prefix..<newEnd]) : ""
+        let normalizedBefore = normalize(oldFragment)
+        let normalizedAfter = normalize(newFragment)
+        guard normalizedBefore != normalizedAfter,
+              !normalizedBefore.isEmpty || !normalizedAfter.isEmpty else { return [] }
+        return [CorrectionDiff(
+            before: oldFragment,
+            after: newFragment,
+            isMeaningful: true,
+            classification: classify(before: oldFragment, after: newFragment)
+        )]
     }
 
     private func tokenize(_ text: String) -> [Token] {

@@ -27,6 +27,24 @@ struct WriteSenseApp: App {
                 .environmentObject(model)
         }
         .defaultSize(width: 620, height: 560)
+
+        Window("Welcome to WriteSense", id: "onboarding") {
+            OnboardingView()
+                .environmentObject(model)
+        }
+        .defaultSize(width: 620, height: 520)
+
+        Window("Beta Diagnostics", id: "diagnostics") {
+            DiagnosticsView()
+                .environmentObject(model)
+        }
+        .defaultSize(width: 680, height: 600)
+
+        Window("Beta Feedback", id: "feedback") {
+            BetaFeedbackView()
+                .environmentObject(model)
+        }
+        .defaultSize(width: 620, height: 650)
     }
 }
 
@@ -39,13 +57,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct StatusLabel: View {
     @EnvironmentObject private var model: AppModel
 
+    private var isActivelyLearning: Bool {
+        model.permissionTrusted && model.storageAvailable &&
+            model.isLearningActive && model.activeApplicationIsApproved
+    }
+
     var body: some View {
         HStack(spacing: 5) {
-            Image(systemName: "pencil.and.outline")
+            Image(systemName: isActivelyLearning ? "pencil.and.outline" : "pause.circle")
             Circle()
-                .fill(model.permissionTrusted && model.isLearningActive ? Color.green : Color.orange)
+                .fill(isActivelyLearning ? Color.green : Color.orange)
                 .frame(width: 6, height: 6)
         }
+        .accessibilityLabel(model.statusMessage)
     }
 }
 
@@ -268,7 +292,7 @@ struct PermissionCard: View {
 }
 
 struct OnboardingCard: View {
-    @EnvironmentObject private var model: AppModel
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -289,8 +313,9 @@ struct OnboardingCard: View {
             Text("After repeated edits, WriteSense can prioritize similar tense corrections and explain why.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
-            Button("I understand") {
-                model.completeOnboarding()
+            Button("Open setup guide") {
+                NSApp.activate(ignoringOtherApps: true)
+                openWindow(id: "onboarding")
             }
             .buttonStyle(.borderedProminent)
         }
@@ -529,6 +554,51 @@ struct SettingsView: View {
             }
 
             Section {
+                Toggle("Content-free local diagnostics", isOn: Binding(
+                    get: { model.diagnosticsEnabled },
+                    set: { model.setDiagnosticsEnabled($0) }
+                ))
+                HStack {
+                    Button {
+                        model.runCompatibilityCheck()
+                    } label: {
+                        Label("Check last active app", systemImage: "checkmark.shield")
+                    }
+                    Spacer()
+                    if let observation = model.latestCompatibilityObservation {
+                        Text(observation.result.title)
+                            .font(.caption)
+                            .foregroundStyle(observation.result.isSuccessfulSafetyResult ? .green : .orange)
+                    }
+                }
+                Button {
+                    openWindow(id: "diagnostics")
+                } label: {
+                    Label("Open beta diagnostics", systemImage: "stethoscope")
+                }
+                Button {
+                    openWindow(id: "feedback")
+                } label: {
+                    Label("Provide beta feedback", systemImage: "bubble.left.and.bubble.right")
+                }
+                Button {
+                    model.restartOnboarding()
+                    openWindow(id: "onboarding")
+                } label: {
+                    Label("Run setup guide again", systemImage: "list.number")
+                }
+                Button {
+                    model.openBundledDocumentation()
+                } label: {
+                    Label("Open privacy and support docs", systemImage: "book.closed")
+                }
+            } header: {
+                Text("Beta and diagnostics")
+            } footer: {
+                Text("Diagnostics remain on this Mac for up to 30 days and contain only outcomes, timings, app identifiers, and error codes—never writing text.")
+            }
+
+            Section {
                 Picker("Activity retention", selection: Binding(
                     get: { model.historyRetentionDays },
                     set: { model.setHistoryRetentionDays($0) }
@@ -577,7 +647,7 @@ struct SettingsView: View {
                 model.deleteAllData()
             }
         } message: {
-            Text("This removes learned patterns, examples, vocabulary, activity, application approvals, preferences, and the local encryption key. This cannot be undone.")
+            Text("This removes learned patterns, examples, vocabulary, activity, diagnostics, application approvals, preferences, run markers, backups, and the local encryption key. This cannot be undone.")
         }
     }
 }

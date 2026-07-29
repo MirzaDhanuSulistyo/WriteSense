@@ -1,6 +1,6 @@
 # Application Compatibility Matrix
 
-This matrix distinguishes implemented behavior from manual release validation. Accessibility behavior can change between application versions, so every production release requires hands-on verification.
+This matrix distinguishes implemented behavior, content-free in-app probes, and manual release validation. Accessibility behavior can change between application versions, so every production release requires hands-on verification.
 
 | Application | Capture design | Replacement design | Default | Validation status |
 |---|---|---|---|---|
@@ -22,6 +22,19 @@ WriteSense blocks:
 - Detectable Safari private-browsing and Chrome Incognito windows.
 - Applications not present in the explicit allowlist.
 - Unsupported or unreadable Accessibility elements.
+
+## In-app compatibility probe
+
+Focus a field in an approved application, return to WriteSense, and select **Beta diagnostics → Check last active app**. The probe records only application identity/version, macOS version, timestamp, and one outcome:
+
+- Readable; the Accessibility value reports that replacement appears supported.
+- Review and Copy only.
+- Secure field blocked.
+- Private context blocked.
+- Unsupported or missing field.
+- Permission/application setup failure.
+
+The probe reads only enough Accessibility state to classify the field and never retains its value. A successful probe is evidence for that single field and version, not universal application certification. It does not perform a destructive test write.
 
 ## Required manual release checklist
 

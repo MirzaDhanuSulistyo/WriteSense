@@ -99,7 +99,11 @@ final class AccessibilityService {
             paragraph: paragraph,
             paragraphRange: TextRange(location: range.location, length: range.length),
             element: element,
-            elementFrame: frameAttribute(from: element)
+            elementFrame: frameAttribute(from: element),
+            isWritable: bundleID != "com.apple.Terminal" && isAttributeSettable(
+                kAXValueAttribute,
+                on: element
+            )
         ))
     }
 
@@ -250,6 +254,16 @@ final class AccessibilityService {
         var range = CFRange()
         guard AXValueGetValue(value as! AXValue, .cfRange, &range) else { return nil }
         return NSRange(location: range.location, length: range.length)
+    }
+
+    private func isAttributeSettable(_ attribute: String, on element: AXUIElement) -> Bool {
+        var settable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(
+            element,
+            attribute as CFString,
+            &settable
+        ) == .success else { return false }
+        return settable.boolValue
     }
 
     private func stringAttribute(_ attribute: String, from element: AXUIElement) -> String? {

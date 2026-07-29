@@ -5,6 +5,7 @@ import Security
 private enum SecureStorageError: LocalizedError {
     case missingEncryptionKey
     case encryptionFailed
+    case unsupportedSchema(Int)
     case keychain(OSStatus)
 
     var errorDescription: String? {
@@ -13,6 +14,8 @@ private enum SecureStorageError: LocalizedError {
             return "The encryption key for local writing data is unavailable."
         case .encryptionFailed:
             return "WriteSense could not encrypt local writing data."
+        case .unsupportedSchema(let version):
+            return "Local data uses unsupported schema version \(version)."
         case .keychain(let status):
             return "The macOS Keychain returned error \(status)."
         }
@@ -21,13 +24,47 @@ private enum SecureStorageError: LocalizedError {
 
 private final class KeychainEncryptionKeyProvider {
     private let service: String
+    private let legacyServices: [String]
     private let account = "local-data-key-v1"
 
-    init(service: String) {
+    init(service: String, legacyServices: [String] = []) {
         self.service = service
+        self.legacyServices = legacyServices
     }
 
     func loadKey() throws -> SymmetricKey? {
+        try loadKey(service: service)
+    }
+
+    func loadOrCreateKey() throws -> SymmetricKey {
+        if let existing = try loadKey() { return existing }
+
+        for legacyService in legacyServices {
+            if let legacyKey = try loadKey(service: legacyService) {
+                return try store(legacyKey, service: service)
+            }
+        }
+
+        return try store(SymmetricKey(size: .bits256), service: service)
+    }
+
+    func deleteKey() throws {
+        var firstError: SecureStorageError?
+        for candidateService in Set([service] + legacyServices) {
+            let query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: candidateService,
+                kSecAttrAccount as String: account
+            ]
+            let status = SecItemDelete(query as CFDictionary)
+            if status != errSecSuccess, status != errSecItemNotFound, firstError == nil {
+                firstError = .keychain(status)
+            }
+        }
+        if let firstError { throw firstError }
+    }
+
+    private func loadKey(service: String) throws -> SymmetricKey? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -44,10 +81,7 @@ private final class KeychainEncryptionKeyProvider {
         return SymmetricKey(data: data)
     }
 
-    func loadOrCreateKey() throws -> SymmetricKey {
-        if let existing = try loadKey() { return existing }
-
-        let key = SymmetricKey(size: .bits256)
+    private func store(_ key: SymmetricKey, service: String) throws -> SymmetricKey {
         let keyData = key.withUnsafeBytes { Data($0) }
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -57,23 +91,12 @@ private final class KeychainEncryptionKeyProvider {
             kSecValueData as String: keyData
         ]
         let status = SecItemAdd(query as CFDictionary, nil)
-        if status == errSecDuplicateItem, let existing = try loadKey() {
+        if status == errSecDuplicateItem,
+           let existing = try loadKey(service: service) {
             return existing
         }
         guard status == errSecSuccess else { throw SecureStorageError.keychain(status) }
         return key
-    }
-
-    func deleteKey() throws {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account
-        ]
-        let status = SecItemDelete(query as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw SecureStorageError.keychain(status)
-        }
     }
 }
 
@@ -85,16 +108,20 @@ final class ProfileStore {
     private let profileURL: URL
     private let settingsURL: URL
     private let historyURL: URL
+    private let runMarkerURL: URL
     private let legacyProfileURL: URL
     private let legacySettingsURL: URL
     private let keyProvider: KeychainEncryptionKeyProvider
 
     private(set) var lastErrorMessage: String?
+    private(set) var lastRecoveryMessage: String?
+    private(set) var recoveredFileNames: Set<String> = []
     private(set) var hasLoadFailure = false
+    private let currentSchemaVersion = 2
 
     init(
         directoryURL: URL? = nil,
-        keychainService: String = "com.writesense.app.secure-storage"
+        keychainService: String = "io.andura.writesense.secure-storage"
     ) {
         encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -111,9 +138,16 @@ final class ProfileStore {
         profileURL = applicationSupport.appendingPathComponent("writing-profile.enc")
         settingsURL = applicationSupport.appendingPathComponent("settings.enc")
         historyURL = applicationSupport.appendingPathComponent("writing-history.enc")
+        runMarkerURL = applicationSupport.appendingPathComponent("run-state.json")
         legacyProfileURL = applicationSupport.appendingPathComponent("writing-profile.json")
         legacySettingsURL = applicationSupport.appendingPathComponent("settings.json")
-        keyProvider = KeychainEncryptionKeyProvider(service: keychainService)
+        let legacyKeychainServices = keychainService == "io.andura.writesense.secure-storage"
+            ? ["com.writesense.app.secure-storage"]
+            : []
+        keyProvider = KeychainEncryptionKeyProvider(
+            service: keychainService,
+            legacyServices: legacyKeychainServices
+        )
         ensureDirectory()
     }
 
@@ -153,19 +187,34 @@ final class ProfileStore {
     }
 
     func pruned(history: WritingHistory, retentionDays: Int, now: Date = Date()) -> WritingHistory {
-        guard retentionDays > 0 else { return .empty }
-        guard let cutoff = Calendar.current.date(byAdding: .day, value: -retentionDays, to: now) else {
-            return history
+        let activityCutoff = retentionDays > 0
+            ? Calendar.current.date(byAdding: .day, value: -retentionDays, to: now)
+            : nil
+        let diagnosticsCutoff = Calendar.current.date(byAdding: .day, value: -30, to: now) ?? .distantPast
+
+        let corrections = activityCutoff.map { cutoff in
+            history.correctionEvents.filter { $0.createdAt >= cutoff }
+        } ?? []
+        let suggestions = activityCutoff.map { cutoff in
+            history.suggestionEvents.filter { $0.createdAt >= cutoff }
+        } ?? []
+        let sessions = activityCutoff.flatMap { cutoff in
+            history.editingSessions?.filter { $0.lastUpdatedAt >= cutoff }
         }
-        let corrections = history.correctionEvents.filter { $0.createdAt >= cutoff }
-        let suggestions = history.suggestionEvents.filter { $0.createdAt >= cutoff }
-        let sessions = history.editingSessions?.filter { $0.lastUpdatedAt >= cutoff }
-        let audit = history.privacyAuditEvents?.filter { $0.createdAt >= cutoff }
+        let audit = activityCutoff.flatMap { cutoff in
+            history.privacyAuditEvents?.filter { $0.createdAt >= cutoff }
+        }
+        let diagnostics = history.diagnosticEvents?.filter { $0.createdAt >= diagnosticsCutoff }
+        let compatibility = history.compatibilityObservations?.filter { $0.createdAt >= diagnosticsCutoff }
+        let runs = history.applicationRuns?.filter { $0.startedAt >= diagnosticsCutoff }
         return WritingHistory(
             correctionEvents: Array(corrections.suffix(5_000)),
             suggestionEvents: Array(suggestions.suffix(10_000)),
             editingSessions: sessions.map { Array($0.suffix(5_000)) },
-            privacyAuditEvents: audit.map { Array($0.suffix(2_000)) }
+            privacyAuditEvents: audit.map { Array($0.suffix(2_000)) },
+            diagnosticEvents: diagnostics.map { Array($0.suffix(10_000)) },
+            compatibilityObservations: compatibility.map { Array($0.suffix(500)) },
+            applicationRuns: runs.map { Array($0.suffix(200)) }
         )
     }
 
@@ -175,13 +224,40 @@ final class ProfileStore {
         settings: StoredSettings
     ) throws -> Data {
         let export = WriteSenseExport(
-            formatVersion: 1,
+            formatVersion: 2,
             exportedAt: Date(),
             profile: profile,
             history: history,
             settings: settings
         )
         return try encoder.encode(export)
+    }
+
+    func beginApplicationRun(now: Date = Date()) -> RunStartResult? {
+        ensureDirectory()
+        let previous: ApplicationRunMarker?
+        if let data = try? Data(contentsOf: runMarkerURL) {
+            previous = try? decoder.decode(ApplicationRunMarker.self, from: data)
+        } else {
+            previous = nil
+        }
+
+        let current = ApplicationRunMarker(id: UUID(), startedAt: now)
+        do {
+            let data = try encoder.encode(current)
+            try data.write(to: runMarkerURL, options: [.atomic])
+            try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: runMarkerURL.path)
+            return RunStartResult(current: current, previousUnclean: previous)
+        } catch {
+            return nil
+        }
+    }
+
+    func finishApplicationRun(_ id: UUID) {
+        guard let data = try? Data(contentsOf: runMarkerURL),
+              let marker = try? decoder.decode(ApplicationRunMarker.self, from: data),
+              marker.id == id else { return }
+        try? fileManager.removeItem(at: runMarkerURL)
     }
 
     @discardableResult
@@ -205,6 +281,8 @@ final class ProfileStore {
         if succeeded {
             hasLoadFailure = false
             lastErrorMessage = nil
+            lastRecoveryMessage = nil
+            recoveredFileNames = []
         }
         return succeeded
     }
@@ -214,44 +292,96 @@ final class ProfileStore {
         encryptedURL: URL,
         legacyURL: URL?
     ) -> T? {
-        if let encrypted = try? Data(contentsOf: encryptedURL) {
+        if fileManager.fileExists(atPath: encryptedURL.path) {
             do {
+                let encrypted = try Data(contentsOf: encryptedURL)
                 guard let key = try keyProvider.loadKey() else {
                     throw SecureStorageError.missingEncryptionKey
                 }
-                let box = try AES.GCM.SealedBox(combined: encrypted)
-                let cleartext = try AES.GCM.open(box, using: key)
-                return try decoder.decode(type, from: cleartext)
+                let decoded: DecodedSecureValue<T> = try decodeSecureValue(
+                    type,
+                    from: encrypted,
+                    using: key
+                )
+                if decoded.requiresMigration {
+                    _ = save(decoded.value, to: encryptedURL)
+                }
+                return decoded.value
             } catch {
-                lastErrorMessage = error.localizedDescription
+                let primaryError = error
+                let backupURL = backupURL(for: encryptedURL)
+                if let backup = try? Data(contentsOf: backupURL),
+                   let key = (try? keyProvider.loadKey()) ?? nil,
+                   let recovered: DecodedSecureValue<T> = try? decodeSecureValue(type, from: backup, using: key) {
+                    do {
+                        try backup.write(to: encryptedURL, options: [.atomic])
+                        try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: encryptedURL.path)
+                        lastRecoveryMessage = "Recovered \(encryptedURL.lastPathComponent) from its encrypted backup."
+                        recoveredFileNames.insert(encryptedURL.lastPathComponent)
+                        return recovered.value
+                    } catch {
+                        lastErrorMessage = error.localizedDescription
+                        hasLoadFailure = true
+                        return nil
+                    }
+                }
+                lastErrorMessage = primaryError.localizedDescription
                 hasLoadFailure = true
                 return nil
             }
         }
 
         guard let legacyURL,
-              let legacyData = try? Data(contentsOf: legacyURL),
-              let decoded = try? decoder.decode(type, from: legacyData) else {
+              fileManager.fileExists(atPath: legacyURL.path) else { return nil }
+        do {
+            let legacyData = try Data(contentsOf: legacyURL)
+            let decoded = try decoder.decode(type, from: legacyData)
+            // One-time migration from the prototype's plaintext JSON files.
+            // Remove plaintext only after its encrypted replacement is durable.
+            if save(decoded, to: encryptedURL) {
+                try? fileManager.removeItem(at: legacyURL)
+            }
+            return decoded
+        } catch {
+            lastErrorMessage = error.localizedDescription
+            hasLoadFailure = true
             return nil
         }
+    }
 
-        // One-time migration from the prototype's plaintext JSON files. Only
-        // remove the plaintext after the encrypted replacement is durable.
-        if save(decoded, to: encryptedURL) {
-            try? fileManager.removeItem(at: legacyURL)
+    private func decodeSecureValue<T: Codable>(
+        _ type: T.Type,
+        from encrypted: Data,
+        using key: SymmetricKey
+    ) throws -> DecodedSecureValue<T> {
+        let box = try AES.GCM.SealedBox(combined: encrypted)
+        let cleartext = try AES.GCM.open(box, using: key)
+        if let envelope = try? decoder.decode(PersistedSecurePayload<T>.self, from: cleartext) {
+            guard envelope.schemaVersion <= currentSchemaVersion else {
+                throw SecureStorageError.unsupportedSchema(envelope.schemaVersion)
+            }
+            return DecodedSecureValue(value: envelope.payload, requiresMigration: envelope.schemaVersion < currentSchemaVersion)
         }
-        return decoded
+        // Version 1 encrypted files contained the Codable object directly.
+        return DecodedSecureValue(value: try decoder.decode(type, from: cleartext), requiresMigration: true)
     }
 
     @discardableResult
-    private func save<T: Encodable>(_ value: T, to url: URL) -> Bool {
+    private func save<T: Codable>(_ value: T, to url: URL) -> Bool {
         guard !hasLoadFailure else { return false }
         do {
             ensureDirectory()
-            let cleartext = try encoder.encode(value)
+            let envelope = PersistedSecurePayload(schemaVersion: currentSchemaVersion, payload: value)
+            let cleartext = try encoder.encode(envelope)
             let key = try keyProvider.loadOrCreateKey()
             let sealed = try AES.GCM.seal(cleartext, using: key)
             guard let combined = sealed.combined else { throw SecureStorageError.encryptionFailed }
+
+            if let existing = try? Data(contentsOf: url) {
+                let backup = backupURL(for: url)
+                try existing.write(to: backup, options: [.atomic])
+                try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: backup.path)
+            }
             try combined.write(to: url, options: [.atomic])
             try? fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
             return true
@@ -259,6 +389,10 @@ final class ProfileStore {
             lastErrorMessage = error.localizedDescription
             return false
         }
+    }
+
+    private func backupURL(for url: URL) -> URL {
+        url.appendingPathExtension("backup")
     }
 
     private func ensureDirectory() {
@@ -269,6 +403,16 @@ final class ProfileStore {
         )
         try? fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
     }
+}
+
+private struct PersistedSecurePayload<Payload: Codable>: Codable {
+    let schemaVersion: Int
+    let payload: Payload
+}
+
+private struct DecodedSecureValue<Value> {
+    let value: Value
+    let requiresMigration: Bool
 }
 
 struct WriteSenseExport: Codable {
@@ -287,6 +431,7 @@ struct StoredSettings: Codable {
     var tonePreference: TonePreference
     var onboardingCompleted: Bool
     var customApplicationNames: [String: String]
+    var diagnosticsEnabled: Bool
 
     private enum CodingKeys: String, CodingKey {
         case approvedBundleIDs
@@ -296,6 +441,7 @@ struct StoredSettings: Codable {
         case tonePreference
         case onboardingCompleted
         case customApplicationNames
+        case diagnosticsEnabled
     }
 
     init(
@@ -305,7 +451,8 @@ struct StoredSettings: Codable {
         historyRetentionDays: Int = 30,
         tonePreference: TonePreference = .preserveVoice,
         onboardingCompleted: Bool = false,
-        customApplicationNames: [String: String] = [:]
+        customApplicationNames: [String: String] = [:],
+        diagnosticsEnabled: Bool = false
     ) {
         self.approvedBundleIDs = approvedBundleIDs
         self.learningEnabled = learningEnabled
@@ -314,6 +461,7 @@ struct StoredSettings: Codable {
         self.tonePreference = tonePreference
         self.onboardingCompleted = onboardingCompleted
         self.customApplicationNames = customApplicationNames
+        self.diagnosticsEnabled = diagnosticsEnabled
     }
 
     init(from decoder: Decoder) throws {
@@ -334,6 +482,7 @@ struct StoredSettings: Codable {
             [String: String].self,
             forKey: .customApplicationNames
         ) ?? [:]
+        diagnosticsEnabled = try container.decodeIfPresent(Bool.self, forKey: .diagnosticsEnabled) ?? false
     }
 
     static let defaults = StoredSettings(
@@ -343,7 +492,8 @@ struct StoredSettings: Codable {
         historyRetentionDays: 30,
         tonePreference: .preserveVoice,
         onboardingCompleted: false,
-        customApplicationNames: [:]
+        customApplicationNames: [:],
+        diagnosticsEnabled: false
     )
 }
 

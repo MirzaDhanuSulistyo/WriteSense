@@ -2,7 +2,7 @@
 
 **Scope:** PRD Phases 0–6
 
-**Current milestone:** MVP feature-complete in code; manual validation and Phase 7 hardening remain.
+**Current milestone:** MVP feature-complete; Phase 7 engineering hardening implemented with external beta validation still required.
 
 ## Phase summary
 
@@ -15,19 +15,20 @@
 | 4 — Local grammar analysis | Implemented | Offline review, explanations, ranges, preview, apply, edit, reject, ignore, and undo are implemented. |
 | 5 — Personalized suggestion ranking | Implemented | Generalized retrieval, application scoping, rejection suppression, tone preference, vocabulary protection, explanations, feedback history, and personalization reset are implemented. |
 | 6 — Insights and user control | Implemented | Trends, counters, pattern examples, vocabulary management, recent correction events, per-event deletion, retention, export, per-app deletion, and complete deletion are implemented. |
-| 7 — Reliability, privacy review, and beta | Not started | Requires external/manual validation and beta operations. |
+| 7 — Reliability, privacy review, and beta | Engineering complete; external sign-off pending | Content-free diagnostics, compatibility probes, recovery, onboarding, feedback, packaging, and release documentation are implemented. Signed-build testing, independent review, and real beta evidence remain. |
 | 8 — Optional cloud intelligence | Not started | Apple Foundation Models support is on-device and is not Phase 8 cloud processing. |
 
 ## Storage and privacy implementation
 
 - Paragraph snapshots remain in memory and are discarded when a capture session resets.
 - Persisted correction events contain only changed fragments and metadata, not full paragraphs.
-- Profile, settings, and activity history use AES-GCM encryption.
+- Profile, settings, activity history, diagnostics, and previous-write backups use AES-GCM encryption.
 - The 256-bit encryption key is stored in macOS Keychain with a device-only accessibility class.
-- Existing plaintext prototype profile and settings files are migrated and removed only after encrypted writes succeed.
+- Versioned payloads migrate existing plaintext and version-1 encrypted data; unreadable primaries recover from the previous encrypted backup when possible.
 - Activity retention supports 0, 7, 30, 90, or 365 days.
-- Content-free editing sessions and privacy audit actions follow the same retention setting.
-- Complete deletion removes the application-support directory and Keychain key.
+- Content-free editing sessions and privacy audit actions follow the writing-activity retention setting.
+- Opt-in diagnostics and compatibility history have a separate 30-day maximum.
+- Complete deletion removes the application-support directory—including backups and run markers—and the Keychain key.
 - Explicit exports are inspectable plaintext JSON and display a warning before saving.
 
 ## Automated coverage
@@ -40,8 +41,10 @@ The test suite covers:
 - Structured correction-event creation.
 - Generalization across different verbs.
 - Application-scoped personalization.
-- Retention pruning.
-- Encrypted round trips, plaintext exclusion, export, and deletion.
+- Activity and diagnostic retention pruning.
+- Encrypted round trips, schema migration, backup recovery, plaintext exclusion, export, and deletion.
+- Content-free diagnostic export and summary calculations.
+- Unclean-run markers and bounded long-paragraph diffing.
 - Legacy settings migration.
 
 Run it with:

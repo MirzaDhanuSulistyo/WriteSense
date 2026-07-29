@@ -2,7 +2,7 @@
 
 **Your writing, improved by your own habits.**
 
-WriteSense is a privacy-first macOS menu bar writing coach. The prototype reads paragraphs only from explicitly approved applications through macOS Accessibility APIs, blocks secure fields, compares before/after text snapshots, and learns recurring edits locally.
+WriteSense is a privacy-first macOS menu bar writing coach. The private-beta candidate reads paragraphs only from explicitly approved applications through macOS Accessibility APIs, blocks secure fields, compares before/after text snapshots, and learns recurring edits locally.
 
 ## What is built
 
@@ -23,6 +23,11 @@ WriteSense is a privacy-first macOS menu bar writing coach. The prototype reads 
 - Plaintext profile export through an explicit save flow.
 - Insights, weekly trends, recent correction events, vocabulary management, and per-pattern controls.
 - Per-application deletion, personalization reset, and complete data-and-Keychain deletion.
+- Five-step trust-oriented onboarding and permission recovery.
+- Content-free local diagnostics, unclean-run detection, latency metrics, and compatibility probes.
+- Structured local beta feedback export with no automatic upload.
+- Versioned encrypted storage, previous-write backups, migration, and recovery.
+- Hardened-runtime beta packaging with optional notarization and release checksums.
 
 ## Run
 
@@ -38,6 +43,14 @@ For a regular `.app` bundle with an Accessibility permission identity:
 ./Scripts/build-app.sh
 open build/WriteSense.app
 ```
+
+For a tested beta archive and checksum:
+
+```sh
+./Scripts/package-beta.sh
+```
+
+External distribution requires a Developer ID Application signature and notarization; see [the beta release guide](docs/beta-release.md).
 
 To run the real on-device Apple Foundation Models evaluation (12 tense forms and 18 grammar categories):
 
@@ -64,17 +77,24 @@ On macOS 26+, Deep Review uses Apple Foundation Models when Apple Intelligence i
 
 - Paragraph snapshots exist only in memory while an editing session is active.
 - Persisted correction events contain changed fragments rather than full paragraphs.
-- Profile, settings, and retained activity files are encrypted with AES-GCM.
+- Profile, settings, retained activity, diagnostics, and previous-write backups are encrypted with AES-GCM.
 - The encryption key is generated locally and stored in macOS Keychain.
-- Activity retention can be disabled or set to 7, 30, 90, or 365 days.
-- Explicit JSON exports are plaintext and should be stored securely.
-- Complete deletion removes local files, preferences, and the Keychain encryption key.
+- Writing-activity retention can be disabled or set to 7, 30, 90, or 365 days.
+- Optional content-free beta diagnostics are retained locally for up to 30 days and never uploaded automatically.
+- Explicit writing, diagnostic, and feedback JSON exports are plaintext and should be reviewed and stored securely.
+- Complete deletion removes primaries, backups, diagnostics, run markers, preferences, and the Keychain encryption key.
 
 ## Documentation
 
 - [Product requirements](docs/macOS_Personalized_Writing_Coach_PRD.md)
 - [MVP implementation status](docs/mvp-status.md)
+- [Phase 7 status](docs/phase-7-status.md)
+- [Private beta release guide](docs/beta-release.md)
 - [Technical validation](docs/technical-validation.md)
 - [Application compatibility matrix](docs/compatibility.md)
 - [Privacy and data architecture](docs/privacy-and-data.md)
+- [Internal security review](docs/security-review.md)
+- [Known limitations](docs/known-limitations.md)
+- [Support and troubleshooting](docs/support.md)
+- [Beta feedback plan](docs/beta-feedback.md)
 - [Monetization strategy](docs/monetize.md)

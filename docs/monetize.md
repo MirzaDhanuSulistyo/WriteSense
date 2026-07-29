@@ -83,7 +83,7 @@ Deep Review is useful, but it should not be the only paid benefit because it is 
 
 ## Work required before a public paid launch
 
-The Phase 0–6 MVP now includes structured correction events, generalized and application-aware personalization, AES-GCM storage with a Keychain-backed key, configurable retention, export, per-application deletion, personalization reset, and complete deletion. The remaining work is production validation and Phase 7 hardening.
+The Phase 0–6 MVP and Phase 7 engineering hardening now include structured correction events, generalized personalization, encrypted recovery, retention and deletion controls, guided onboarding, content-free diagnostics, compatibility probes, beta feedback, and a signed/notarized packaging pipeline. The remaining work is external validation, beta evidence, and commercial infrastructure.
 
 ### Privacy and security validation
 
@@ -101,12 +101,11 @@ The Phase 0–6 MVP now includes structured correction events, generalized and a
 
 ### Distribution and reliability
 
-- Notarize and package release builds.
+- Produce the first Developer ID-signed and notarized archive with the implemented beta packaging pipeline.
+- Complete the manual compatibility matrix for Mail, Notes, TextEdit, Safari, and Chrome using that exact archive.
+- Validate the implemented content-free crash, latency, permission, and compatibility diagnostics with real beta sessions.
 - Add a secure update mechanism.
 - Add trial and license management.
-- Complete the manual compatibility matrix for Mail, Notes, TextEdit, Safari, and Chrome.
-- Add privacy-safe crash and product analytics with no raw text.
-- Expand first-run onboarding with a guided sample learning interaction.
 
 ## Team expansion
 

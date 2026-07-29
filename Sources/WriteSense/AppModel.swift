@@ -10,6 +10,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var historyRetentionDays: Int
     @Published private(set) var tonePreference: TonePreference
     @Published private(set) var onboardingCompleted: Bool
+    @Published private(set) var diagnosticsEnabled: Bool
+    @Published private(set) var latestCompatibilityObservation: CompatibilityObservation?
     @Published private(set) var storageAvailable: Bool
     @Published private(set) var permissionTrusted: Bool
     @Published private(set) var currentApplicationName = "No supported app detected"
@@ -31,6 +33,11 @@ final class AppModel: ObservableObject {
     private let store: ProfileStore
     private var settings: StoredSettings
     private var timer: Timer?
+    private var terminationObserver: NSObjectProtocol?
+    private var workspaceActivationObserver: NSObjectProtocol?
+    private var currentRunID: UUID?
+    private var diagnosticsDirty = false
+    private var lastDiagnosticsSaveAt = Date.distantPast
     private var pendingSnapshot: String?
     private var lastObservedText: String?
     private var lastChangedAt: Date?
@@ -44,6 +51,8 @@ final class AppModel: ObservableObject {
     private var undoInfo: UndoInfo?
     private var lastPromptedParagraph: String?
     private let typingPauseInterval: TimeInterval = 0.9
+    private let diagnosticsFlushInterval: TimeInterval = 15
+    private let maximumReviewUTF16Length = 12_000
     private lazy var floatingPanel = FloatingSuggestionPanelController(model: self)
 
     static let retentionOptions = [0, 7, 30, 90, 365]
@@ -88,6 +97,8 @@ final class AppModel: ObservableObject {
         var bundleIDs = Set(history.correctionEvents.map(\.applicationBundleID))
         bundleIDs.formUnion(history.suggestionEvents.compactMap(\.applicationBundleID))
         bundleIDs.formUnion((history.editingSessions ?? []).map(\.applicationBundleID))
+        bundleIDs.formUnion((history.diagnosticEvents ?? []).compactMap(\.applicationBundleID))
+        bundleIDs.formUnion((history.compatibilityObservations ?? []).map(\.applicationBundleID))
         bundleIDs.formUnion(profile.patterns.compactMap(\.applicationBundleID))
         bundleIDs.formUnion(profile.patterns.compactMap(\.exampleApplicationBundleID))
         for pattern in profile.patterns {
@@ -169,6 +180,16 @@ final class AppModel: ObservableObject {
         return Double(positive) / Double(events.count)
     }
 
+    var diagnosticsSummary: DiagnosticsSummary {
+        DiagnosticsSummary.make(from: history)
+    }
+
+    var recentCompatibilityObservations: [CompatibilityObservation] {
+        Array((history.compatibilityObservations ?? [])
+            .sorted { $0.createdAt > $1.createdAt }
+            .prefix(20))
+    }
+
     var improvementTrendDescription: String {
         guard !history.correctionEvents.isEmpty else {
             return "WriteSense needs more activity before it can show a trend."
@@ -185,13 +206,25 @@ final class AppModel: ObservableObject {
 
     init(store: ProfileStore = ProfileStore()) {
         self.store = store
-        let loadedSettings = store.loadSettings()
+        var loadedSettings = store.loadSettings()
+        let recoveredSettings = store.recoveredFileNames.contains("settings.enc")
+        if recoveredSettings {
+            // A previous settings backup may predate a user's revocation or
+            // pause choice. Recover preferences, but fail closed for capture.
+            loadedSettings.approvedBundleIDs = []
+            loadedSettings.learningEnabled = false
+            loadedSettings.diagnosticsEnabled = false
+            loadedSettings.onboardingCompleted = false
+            _ = store.save(settings: loadedSettings)
+        }
         settings = loadedSettings
         isLearningActive = loadedSettings.learningEnabled
         capitalizationChecksEnabled = loadedSettings.capitalizationChecksEnabled
         historyRetentionDays = loadedSettings.historyRetentionDays
         tonePreference = loadedSettings.tonePreference
         onboardingCompleted = loadedSettings.onboardingCompleted
+        diagnosticsEnabled = loadedSettings.diagnosticsEnabled
+        latestCompatibilityObservation = nil
 
         var loadedProfile = store.loadProfile()
         let profileCountBeforeCleanup = loadedProfile.patterns.count
@@ -223,6 +256,7 @@ final class AppModel: ObservableObject {
             retentionDays: loadedSettings.historyRetentionDays
         )
         history = prunedHistory
+        latestCompatibilityObservation = prunedHistory.compatibilityObservations?.last
         if prunedHistory != originalHistory {
             store.save(history: prunedHistory)
         }
@@ -234,6 +268,17 @@ final class AppModel: ObservableObject {
             isLearningActive = false
             statusMessage = "Local data unavailable — learning paused"
             notice = "Local data could not be opened: \(storageError). Delete all data to recover."
+        } else if let recovery = store.lastRecoveryMessage {
+            notice = recoveredSettings
+                ? "\(recovery) Learning, diagnostics, and application approvals were paused for safety."
+                : recovery
+        }
+        setupLifecycleObservers()
+        if diagnosticsEnabled && storageAvailable {
+            beginApplicationRunTracking()
+            if store.lastRecoveryMessage != nil {
+                recordDiagnostic(.storageRecovery, succeeded: true)
+            }
         }
         startPolling()
     }
@@ -245,12 +290,16 @@ final class AppModel: ObservableObject {
         notice = "Setup complete. Enable learning when you are ready."
     }
 
+    func restartOnboarding() {
+        onboardingCompleted = false
+        settings.onboardingCompleted = false
+        saveSettings()
+    }
+
     func refreshPermission() {
-        permissionTrusted = AccessibilityService.Permission.isTrusted
+        updatePermissionState(AccessibilityService.Permission.isTrusted, announceRecovery: true)
         if !permissionTrusted {
             statusMessage = "Accessibility permission required"
-        } else if statusMessage == "Accessibility permission required" {
-            statusMessage = isLearningActive ? "Ready to learn" : "Learning is paused"
         }
     }
 
@@ -322,6 +371,28 @@ final class AppModel: ObservableObject {
         notice = "Writing preference set to “\(preference.title).”"
     }
 
+    func setDiagnosticsEnabled(_ enabled: Bool) {
+        guard diagnosticsEnabled != enabled else { return }
+        if !enabled {
+            finishApplicationRunTracking()
+            history.diagnosticEvents = nil
+            history.compatibilityObservations = nil
+            history.applicationRuns = nil
+            latestCompatibilityObservation = nil
+            diagnosticsDirty = false
+        }
+        diagnosticsEnabled = enabled
+        settings.diagnosticsEnabled = enabled
+        saveSettings()
+        saveHistory()
+        if enabled && storageAvailable {
+            beginApplicationRunTracking()
+        }
+        notice = enabled
+            ? "Content-free local diagnostics enabled. Nothing is uploaded."
+            : "Local diagnostics and compatibility history deleted."
+    }
+
     func toggleApplication(_ application: SupportedApplication) {
         if settings.approvedBundleIDs.contains(application.bundleID) {
             settings.approvedBundleIDs.remove(application.bundleID)
@@ -349,7 +420,7 @@ final class AppModel: ObservableObject {
     func addFrontmostApplication() {
         let frontmost = NSWorkspace.shared.frontmostApplication
         let frontmostBundleID = frontmost?.bundleIdentifier
-        let isSelf = frontmostBundleID == Bundle.main.bundleIdentifier || frontmostBundleID == "com.writesense.app"
+        let isSelf = frontmostBundleID == Bundle.main.bundleIdentifier || frontmostBundleID == "io.andura.writesense"
         let bundleID = isSelf ? lastExternalBundleID : frontmostBundleID
         let applicationName = isSelf
             ? lastExternalApplicationName
@@ -385,14 +456,22 @@ final class AppModel: ObservableObject {
             return
         }
         guard let captured = captureApprovedParagraph() else { return }
+        guard reviewLengthIsSupported(captured.paragraph, operation: .localReview, bundleID: captured.applicationBundleID) else { return }
         currentCapture = captured
         lastPromptedParagraph = captured.paragraph
+        let reviewStartedAt = Date()
         let analysis = languageEngine.analyze(
             captured.paragraph,
             profile: profileForAnalysis(in: captured.applicationBundleID),
             applicationBundleID: captured.applicationBundleID,
             includeCapitalization: capitalizationChecksEnabled,
             tonePreference: tonePreference
+        )
+        recordDiagnostic(
+            .localReview,
+            succeeded: true,
+            startedAt: reviewStartedAt,
+            applicationBundleID: captured.applicationBundleID
         )
         lastReviewLanguage = analysis.language
         latestSuggestions = analysis.suggestions
@@ -408,6 +487,19 @@ final class AppModel: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
+    func openBundledDocumentation() {
+        guard let resources = Bundle.main.resourceURL else {
+            notice = "Bundled documentation is available in packaged beta builds."
+            return
+        }
+        let documentation = resources.appendingPathComponent("Documentation", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: documentation.path) else {
+            notice = "Bundled documentation is available in packaged beta builds."
+            return
+        }
+        NSWorkspace.shared.open(documentation)
+    }
+
     func deepReviewCurrentParagraph() {
         refreshPermission()
         refreshOnDeviceModelStatus()
@@ -421,22 +513,31 @@ final class AppModel: ObservableObject {
         }
         guard !isDeepReviewing else { return }
         guard let captured = captureApprovedParagraph() else { return }
+        guard reviewLengthIsSupported(captured.paragraph, operation: .deepReview, bundleID: captured.applicationBundleID) else { return }
 
         currentCapture = captured
         lastPromptedParagraph = captured.paragraph
         isDeepReviewing = true
         notice = "Reviewing privately with Apple Intelligence…"
+        let deepReviewStartedAt = Date()
 
         Task { [weak self] in
             guard let self else { return }
             defer { self.isDeepReviewing = false }
             let analysisProfile = self.profileForAnalysis(in: captured.applicationBundleID)
+            let localReviewStartedAt = Date()
             let local = self.languageEngine.analyze(
                 captured.paragraph,
                 profile: analysisProfile,
                 applicationBundleID: captured.applicationBundleID,
                 includeCapitalization: self.capitalizationChecksEnabled,
                 tonePreference: self.tonePreference
+            )
+            self.recordDiagnostic(
+                .localReview,
+                succeeded: true,
+                startedAt: localReviewStartedAt,
+                applicationBundleID: captured.applicationBundleID
             )
             do {
                 let modelSuggestions = try await self.foundationModelService.review(
@@ -446,14 +547,33 @@ final class AppModel: ObservableObject {
                 )
                 self.lastReviewLanguage = local.language
                 self.latestSuggestions = self.merging(local.suggestions, with: modelSuggestions)
+                self.recordDiagnostic(
+                    .deepReview,
+                    succeeded: true,
+                    startedAt: deepReviewStartedAt,
+                    applicationBundleID: captured.applicationBundleID
+                )
                 self.notice = "Deep Review completed entirely on this Mac."
             } catch FoundationModelServiceError.noUsableSuggestions {
+                self.recordDiagnostic(
+                    .deepReview,
+                    succeeded: true,
+                    startedAt: deepReviewStartedAt,
+                    applicationBundleID: captured.applicationBundleID
+                )
                 self.lastReviewLanguage = local.language
                 self.latestSuggestions = local.suggestions
                 self.notice = local.suggestions.isEmpty
                     ? "Apple Intelligence found no corrections."
                     : "No additional Apple Intelligence corrections were found."
             } catch {
+                self.recordDiagnostic(
+                    .deepReview,
+                    succeeded: false,
+                    startedAt: deepReviewStartedAt,
+                    applicationBundleID: captured.applicationBundleID,
+                    errorCode: .foundationModelError
+                )
                 self.notice = error.localizedDescription
                 self.refreshOnDeviceModelStatus()
             }
@@ -513,11 +633,19 @@ final class AppModel: ObservableObject {
             notice = "The last change can no longer be undone in this field."
             return
         }
+        let replacementStartedAt = Date()
         let success = accessibility.replace(
             expected: undoInfo.replacement,
             with: undoInfo.original,
             at: undoInfo.range,
             in: captured
+        )
+        recordDiagnostic(
+            .textReplacement,
+            succeeded: success,
+            startedAt: replacementStartedAt,
+            applicationBundleID: captured.applicationBundleID,
+            errorCode: success ? nil : .undoReplacementFailed
         )
         if success {
             learner.undo(
@@ -544,12 +672,14 @@ final class AppModel: ObservableObject {
     func resetPersonalization() {
         resetCaptureSession()
         profile = .empty
-        history = .empty
+        history.correctionEvents = []
+        history.suggestionEvents = []
+        history.editingSessions = nil
         latestSuggestions = []
         saveProfile()
         saveHistory()
         recordAudit(.personalizationReset)
-        notice = "Personalization was reset. Application approvals and preferences were kept."
+        notice = "Personalization was reset. Application approvals and content-free diagnostics were kept."
     }
 
     func deleteData(for application: SupportedApplication) {
@@ -558,6 +688,11 @@ final class AppModel: ObservableObject {
         history.suggestionEvents.removeAll { $0.applicationBundleID == application.bundleID }
         history.editingSessions?.removeAll { $0.applicationBundleID == application.bundleID }
         history.privacyAuditEvents?.removeAll { $0.applicationBundleID == application.bundleID }
+        history.diagnosticEvents?.removeAll { $0.applicationBundleID == application.bundleID }
+        history.compatibilityObservations?.removeAll { $0.applicationBundleID == application.bundleID }
+        if latestCompatibilityObservation?.applicationBundleID == application.bundleID {
+            latestCompatibilityObservation = nil
+        }
         profile.suggestionPreferences?.removeAll { $0.applicationBundleID == application.bundleID }
         profile.patterns = profile.patterns.compactMap { original in
             var pattern = original
@@ -659,6 +794,125 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func runCompatibilityCheck() {
+        let startedAt = Date()
+        guard let application = compatibilityTargetApplication(),
+              let bundleID = application.bundleIdentifier else {
+            let observation = CompatibilityObservation(
+                applicationName: "No application",
+                applicationBundleID: "unknown",
+                result: .applicationUnavailable
+            )
+            latestCompatibilityObservation = observation
+            recordCompatibility(observation, startedAt: startedAt)
+            notice = observation.result.title
+            return
+        }
+
+        let result: CompatibilityResult
+        if !permissionTrusted {
+            result = .permissionRequired
+        } else if !settings.approvedBundleIDs.contains(bundleID) {
+            result = .applicationNotApproved
+        } else {
+            switch accessibility.focusedParagraphResult(for: application) {
+            case .success(let captured):
+                result = captured.isWritable ? .readWrite : .readOnly
+            case .failure(.secureField):
+                result = .secureFieldBlocked
+            case .failure(.sensitiveContext):
+                result = .privateContextBlocked
+            case .failure(.noFocusedElement), .failure(.emptyText):
+                result = .noFocusedField
+            case .failure(.unsupportedField), .failure(.unreadableText):
+                result = .unsupportedField
+            case .failure(.noApplication):
+                result = .applicationUnavailable
+            }
+        }
+
+        let version = application.bundleURL
+            .flatMap(Bundle.init(url:))?
+            .object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let observation = CompatibilityObservation(
+            applicationName: application.localizedName ?? bundleID,
+            applicationBundleID: bundleID,
+            result: result,
+            applicationVersion: version
+        )
+        latestCompatibilityObservation = observation
+        recordCompatibility(observation, startedAt: startedAt)
+        notice = "\(observation.applicationName): \(result.title)."
+    }
+
+    func exportDiagnostics() {
+        guard diagnosticsEnabled else {
+            notice = "Enable local diagnostics before exporting a diagnostic report."
+            return
+        }
+        flushDiagnosticsIfNeeded(force: true)
+        do {
+            let data = try encodedJSON(DiagnosticsExport.make(from: history))
+            guard try saveExport(
+                data,
+                title: "Export WriteSense Diagnostics",
+                filename: "WriteSense-Diagnostics.json",
+                message: "This content-free report contains app identifiers, outcomes, timestamps, and latency—never writing text."
+            ) else { return }
+            notice = "Diagnostic report exported."
+        } catch {
+            notice = "Diagnostic export failed: \(error.localizedDescription)"
+        }
+    }
+
+    func clearDiagnostics() {
+        let currentRun = currentRunID.flatMap { id in
+            history.applicationRuns?.first(where: { $0.id == id })
+        }
+        history.diagnosticEvents = nil
+        history.compatibilityObservations = nil
+        history.applicationRuns = currentRun.map { [$0] }
+        latestCompatibilityObservation = nil
+        diagnosticsDirty = false
+        saveHistory()
+        notice = "Local diagnostics and compatibility history cleared."
+    }
+
+    @discardableResult
+    func exportBetaFeedback(
+        usefulnessRating: Int,
+        recommendationQualityRating: Int,
+        trustRating: Int,
+        keepLearningEnabled: Bool,
+        issues: Set<BetaFeedbackIssue>,
+        comments: String,
+        includeDiagnostics: Bool
+    ) -> Bool {
+        let report = BetaFeedbackReport(
+            usefulnessRating: min(5, max(1, usefulnessRating)),
+            recommendationQualityRating: min(5, max(1, recommendationQualityRating)),
+            trustRating: min(5, max(1, trustRating)),
+            keepLearningEnabled: keepLearningEnabled,
+            issues: issues.sorted { $0.rawValue < $1.rawValue },
+            comments: String(comments.prefix(4_000)),
+            diagnostics: includeDiagnostics && diagnosticsEnabled ? diagnosticsSummary : nil
+        )
+        do {
+            let data = try encodedJSON(report)
+            guard try saveExport(
+                data,
+                title: "Save WriteSense Beta Feedback",
+                filename: "WriteSense-Beta-Feedback.json",
+                message: "Only your survey answers and optional content-free summary are included. Review the JSON before sharing it."
+            ) else { return false }
+            notice = "Beta feedback report saved. Thank you."
+            return true
+        } catch {
+            notice = "Feedback export failed: \(error.localizedDescription)"
+            return false
+        }
+    }
+
     func deleteAllData() {
         resetCaptureSession()
         floatingPanel.hide()
@@ -675,6 +929,10 @@ final class AppModel: ObservableObject {
         historyRetentionDays = settings.historyRetentionDays
         tonePreference = settings.tonePreference
         onboardingCompleted = settings.onboardingCompleted
+        diagnosticsEnabled = settings.diagnosticsEnabled
+        latestCompatibilityObservation = nil
+        currentRunID = nil
+        diagnosticsDirty = false
         updateStatus()
         notice = deleted
             ? "All WriteSense data, preferences, and encryption keys were deleted."
@@ -690,7 +948,16 @@ final class AppModel: ObservableObject {
             copyReplacement(replacement)
             return
         }
-        guard accessibility.replace(suggestion, with: replacement, in: captured) else {
+        let replacementStartedAt = Date()
+        let replacementSucceeded = accessibility.replace(suggestion, with: replacement, in: captured)
+        recordDiagnostic(
+            .textReplacement,
+            succeeded: replacementSucceeded,
+            startedAt: replacementStartedAt,
+            applicationBundleID: captured.applicationBundleID,
+            errorCode: replacementSucceeded ? nil : .staleOrUnsupportedRange
+        )
+        guard replacementSucceeded else {
             notice = "The paragraph changed, so this suggestion was not applied."
             return
         }
@@ -781,12 +1048,216 @@ final class AppModel: ObservableObject {
                 length: max(0, captured.paragraphRange.length + delta)
             ),
             element: captured.element,
-            elementFrame: captured.elementFrame
+            elementFrame: captured.elementFrame,
+            isWritable: captured.isWritable
         )
         lastPromptedParagraph = correctedParagraph
         lastObservedText = correctedParagraph
         pendingSnapshot = correctedParagraph
         lastChangedAt = Date()
+    }
+
+    private func reviewLengthIsSupported(
+        _ paragraph: String,
+        operation: DiagnosticOperation,
+        bundleID: String
+    ) -> Bool {
+        guard (paragraph as NSString).length <= maximumReviewUTF16Length else {
+            recordDiagnostic(
+                operation,
+                succeeded: false,
+                applicationBundleID: bundleID,
+                errorCode: .paragraphTooLong
+            )
+            notice = "This paragraph is too long for a safe interactive review. Review a shorter paragraph."
+            return false
+        }
+        return true
+    }
+
+    private func compatibilityTargetApplication() -> NSRunningApplication? {
+        if let frontmost = NSWorkspace.shared.frontmostApplication,
+           let bundleID = frontmost.bundleIdentifier,
+           bundleID != Bundle.main.bundleIdentifier,
+           bundleID != "io.andura.writesense" {
+            rememberExternalApplication(frontmost)
+            return frontmost
+        }
+        guard let lastExternalBundleID else { return nil }
+        return NSRunningApplication.runningApplications(withBundleIdentifier: lastExternalBundleID).first
+    }
+
+    private func recordCompatibility(_ observation: CompatibilityObservation, startedAt: Date) {
+        guard diagnosticsEnabled, storageAvailable else { return }
+        var observations = history.compatibilityObservations ?? []
+        observations.append(observation)
+        history.compatibilityObservations = observations
+        recordDiagnostic(
+            .compatibilityCheck,
+            succeeded: observation.result.isSuccessfulSafetyResult,
+            startedAt: startedAt,
+            applicationBundleID: observation.applicationBundleID,
+            errorCode: observation.result.isSuccessfulSafetyResult ? nil : observation.result.diagnosticErrorCode
+        )
+        if observation.result == .secureFieldBlocked || observation.result == .privateContextBlocked {
+            recordDiagnostic(
+                .secureContextBlocked,
+                succeeded: true,
+                applicationBundleID: observation.applicationBundleID,
+                errorCode: observation.result.diagnosticErrorCode
+            )
+        }
+        history = store.pruned(history: history, retentionDays: historyRetentionDays)
+        saveHistory()
+    }
+
+    private func encodedJSON<T: Encodable>(_ value: T) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        return try encoder.encode(value)
+    }
+
+    private func saveExport(
+        _ data: Data,
+        title: String,
+        filename: String,
+        message: String
+    ) throws -> Bool {
+        let panel = NSSavePanel()
+        panel.title = title
+        panel.nameFieldStringValue = filename
+        panel.allowedContentTypes = [.json]
+        panel.canCreateDirectories = true
+        panel.message = message
+        guard panel.runModal() == .OK, let url = panel.url else { return false }
+        try data.write(to: url, options: [.atomic])
+        return true
+    }
+
+    private func setupLifecycleObservers() {
+        workspaceActivationObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
+                return
+            }
+            MainActor.assumeIsolated {
+                self?.rememberExternalApplication(application)
+            }
+        }
+
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.prepareForTermination()
+            }
+        }
+    }
+
+    private func rememberExternalApplication(_ application: NSRunningApplication) {
+        guard let bundleID = application.bundleIdentifier,
+              bundleID != Bundle.main.bundleIdentifier,
+              bundleID != "io.andura.writesense" else { return }
+        lastExternalBundleID = bundleID
+        lastExternalApplicationName = application.localizedName ?? bundleID
+    }
+
+    private func beginApplicationRunTracking() {
+        guard currentRunID == nil,
+              let start = store.beginApplicationRun() else { return }
+        var runs = history.applicationRuns ?? []
+        var foundUncleanRun = false
+        for index in runs.indices where runs[index].cleanExit == nil {
+            runs[index].endedAt = Date()
+            runs[index].cleanExit = false
+            foundUncleanRun = true
+        }
+        if let previous = start.previousUnclean {
+            if let index = runs.firstIndex(where: { $0.id == previous.id }) {
+                runs[index].endedAt = Date()
+                runs[index].cleanExit = false
+            } else {
+                runs.append(ApplicationRunRecord(
+                    id: previous.id,
+                    startedAt: previous.startedAt,
+                    endedAt: Date(),
+                    cleanExit: false
+                ))
+            }
+            foundUncleanRun = true
+        }
+        if foundUncleanRun {
+            var diagnostics = history.diagnosticEvents ?? []
+            diagnostics.append(DiagnosticEvent(
+                operation: .uncleanTermination,
+                succeeded: false,
+                errorCode: .previousRunDidNotExitCleanly
+            ))
+            history.diagnosticEvents = diagnostics
+        }
+        runs.append(ApplicationRunRecord(
+            id: start.current.id,
+            startedAt: start.current.startedAt
+        ))
+        history.applicationRuns = runs
+        currentRunID = start.current.id
+        history = store.pruned(history: history, retentionDays: historyRetentionDays)
+        saveHistory()
+    }
+
+    private func finishApplicationRunTracking() {
+        guard let currentRunID else { return }
+        finalizeEditingSession()
+        if let index = history.applicationRuns?.firstIndex(where: { $0.id == currentRunID }) {
+            history.applicationRuns?[index].endedAt = Date()
+            history.applicationRuns?[index].cleanExit = true
+        }
+        if storageAvailable && store.save(history: history) {
+            store.finishApplicationRun(currentRunID)
+            diagnosticsDirty = false
+            lastDiagnosticsSaveAt = Date()
+        }
+        self.currentRunID = nil
+    }
+
+    private func prepareForTermination() {
+        timer?.invalidate()
+        flushDiagnosticsIfNeeded(force: true)
+        finishApplicationRunTracking()
+    }
+
+    private func recordDiagnostic(
+        _ operation: DiagnosticOperation,
+        succeeded: Bool,
+        startedAt: Date? = nil,
+        applicationBundleID: String? = nil,
+        errorCode: DiagnosticErrorCode? = nil
+    ) {
+        guard diagnosticsEnabled, storageAvailable else { return }
+        let duration = startedAt.map { max(0, Date().timeIntervalSince($0) * 1_000) }
+        var events = history.diagnosticEvents ?? []
+        events.append(DiagnosticEvent(
+            operation: operation,
+            succeeded: succeeded,
+            durationMilliseconds: duration,
+            applicationBundleID: applicationBundleID,
+            errorCode: errorCode
+        ))
+        history.diagnosticEvents = events
+        diagnosticsDirty = true
+    }
+
+    private func flushDiagnosticsIfNeeded(force: Bool = false) {
+        guard diagnosticsDirty,
+              force || Date().timeIntervalSince(lastDiagnosticsSaveAt) >= diagnosticsFlushInterval else { return }
+        history = store.pruned(history: history, retentionDays: historyRetentionDays)
+        saveHistory()
     }
 
     private func startPolling() {
@@ -803,7 +1274,8 @@ final class AppModel: ObservableObject {
     }
 
     private func pollFocusedText() {
-        permissionTrusted = AccessibilityService.Permission.isTrusted
+        flushDiagnosticsIfNeeded()
+        updatePermissionState(AccessibilityService.Permission.isTrusted, announceRecovery: true)
         guard permissionTrusted else {
             statusMessage = "Accessibility permission required"
             resetCaptureSession()
@@ -827,7 +1299,7 @@ final class AppModel: ObservableObject {
             resetCaptureSession()
             return
         }
-        if bundleID != Bundle.main.bundleIdentifier && bundleID != "com.writesense.app" {
+        if bundleID != Bundle.main.bundleIdentifier && bundleID != "io.andura.writesense" {
             lastExternalBundleID = bundleID
             lastExternalApplicationName = frontmost?.localizedName ?? bundleID
         }
@@ -846,6 +1318,12 @@ final class AppModel: ObservableObject {
                     recordAudit(
                         reason == .secureField ? .secureFieldBlocked : .privateContextBlocked,
                         applicationBundleID: bundleID
+                    )
+                    recordDiagnostic(
+                        .secureContextBlocked,
+                        succeeded: true,
+                        applicationBundleID: bundleID,
+                        errorCode: reason == .secureField ? .secureFieldBlocked : .privateContextBlocked
                     )
                     lastAuditedCaptureFailure = (reason, bundleID)
                 }
@@ -879,7 +1357,14 @@ final class AppModel: ObservableObject {
               Date().timeIntervalSince(lastChangedAt) >= typingPauseInterval else { return }
 
         if let snapshot = pendingSnapshot, snapshot != captured.paragraph {
+            let diffStartedAt = Date()
             let diffs = diffEngine.diffs(before: snapshot, after: captured.paragraph)
+            recordDiagnostic(
+                .diffGeneration,
+                succeeded: true,
+                startedAt: diffStartedAt,
+                applicationBundleID: captured.applicationBundleID
+            )
             if captured.applicationBundleID != "com.apple.Terminal" {
                 var learnedEvents: [CorrectionEvent] = []
                 for diff in diffs where diff.isMeaningful {
@@ -915,17 +1400,33 @@ final class AppModel: ObservableObject {
         // when the paragraph was already complete when WriteSense started.
         if lastPromptedParagraph != captured.paragraph {
             lastPromptedParagraph = captured.paragraph
-            let analysis = languageEngine.analyze(
-                captured.paragraph,
-                profile: profileForAnalysis(in: captured.applicationBundleID),
-                applicationBundleID: captured.applicationBundleID,
-                includeCapitalization: capitalizationChecksEnabled,
-                tonePreference: tonePreference
-            )
-            if !analysis.suggestions.isEmpty {
-                lastReviewLanguage = analysis.language
-                latestSuggestions = analysis.suggestions
-                floatingPanel.show(near: captured.elementFrame)
+            if (captured.paragraph as NSString).length <= maximumReviewUTF16Length {
+                let reviewStartedAt = Date()
+                let analysis = languageEngine.analyze(
+                    captured.paragraph,
+                    profile: profileForAnalysis(in: captured.applicationBundleID),
+                    applicationBundleID: captured.applicationBundleID,
+                    includeCapitalization: capitalizationChecksEnabled,
+                    tonePreference: tonePreference
+                )
+                recordDiagnostic(
+                    .localReview,
+                    succeeded: true,
+                    startedAt: reviewStartedAt,
+                    applicationBundleID: captured.applicationBundleID
+                )
+                if !analysis.suggestions.isEmpty {
+                    lastReviewLanguage = analysis.language
+                    latestSuggestions = analysis.suggestions
+                    floatingPanel.show(near: captured.elementFrame)
+                }
+            } else {
+                recordDiagnostic(
+                    .localReview,
+                    succeeded: false,
+                    applicationBundleID: captured.applicationBundleID,
+                    errorCode: .paragraphTooLong
+                )
             }
         }
 
@@ -1008,6 +1509,29 @@ final class AppModel: ObservableObject {
         currentCapture = nil
         lastPromptedParagraph = nil
         floatingPanel.hide()
+    }
+
+    private func updatePermissionState(_ trusted: Bool, announceRecovery: Bool) {
+        guard permissionTrusted != trusted else { return }
+        permissionTrusted = trusted
+        if trusted {
+            recordDiagnostic(.permissionRestored, succeeded: true)
+            statusMessage = isLearningActive ? "Ready to learn" : "Learning is paused"
+            if announceRecovery {
+                notice = "Accessibility permission restored."
+            }
+        } else {
+            recordDiagnostic(
+                .permissionUnavailable,
+                succeeded: false,
+                errorCode: .accessibilityPermissionMissing
+            )
+            statusMessage = "Accessibility permission required"
+            resetCaptureSession()
+            if announceRecovery {
+                notice = "Accessibility permission was removed. Learning has stopped."
+            }
+        }
     }
 
     private func updateStatus() {
@@ -1093,6 +1617,9 @@ final class AppModel: ObservableObject {
     private func saveHistory() {
         if !store.save(history: history) {
             markStorageUnavailable("Writing history could not be saved")
+        } else {
+            diagnosticsDirty = false
+            lastDiagnosticsSaveAt = Date()
         }
     }
 

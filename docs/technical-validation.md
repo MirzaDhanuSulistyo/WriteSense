@@ -43,8 +43,8 @@ The automated suite validates language analysis, diff extraction, multi-edit han
 swift test
 ```
 
-Accessibility APIs require real GUI processes and user-granted permissions, so application compatibility cannot be certified through unit tests. Use the manual checklist in [compatibility.md](compatibility.md) before entering Phase 7 or publishing compatibility claims.
+Accessibility APIs require real GUI processes and user-granted permissions, so application compatibility cannot be certified through unit tests. Use the in-app content-free probe and manual checklist in [compatibility.md](compatibility.md) before distributing a beta or publishing compatibility claims.
 
 ## Exit assessment
 
-The architecture is feasible for a limited supported-application prototype. Phase 0 code and documentation are present, but final acceptance still requires hands-on read/write verification in at least three target applications on a signed build.
+The architecture is feasible for a limited private beta. Automated and in-app diagnostic paths are present, but release acceptance still requires hands-on read/write verification in at least three target applications on the exact signed and notarized build.

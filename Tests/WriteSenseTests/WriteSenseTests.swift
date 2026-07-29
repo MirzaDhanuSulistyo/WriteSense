@@ -54,6 +54,7 @@ final class WriteSenseTests: XCTestCase {
 
         XCTAssertTrue(settings.capitalizationChecksEnabled)
         XCTAssertTrue(settings.learningEnabled)
+        XCTAssertFalse(settings.diagnosticsEnabled, "Legacy users must opt in to beta diagnostics")
     }
 
     func testLegacyProfileDecodesWithoutGeneralizationMetadata() throws {
@@ -222,6 +223,18 @@ final class WriteSenseTests: XCTestCase {
         XCTAssertEqual(diffs.map(\.before), ["have", "a", "send"])
         XCTAssertEqual(diffs.map(\.after), ["has", "an", "sent"])
         XCTAssertTrue(diffs.allSatisfy(\.isMeaningful))
+    }
+
+    func testLongParagraphDiffUsesBoundedFallback() {
+        let prefix = Array(repeating: "word", count: 550).joined(separator: " ")
+        let suffix = Array(repeating: "tail", count: 20).joined(separator: " ")
+        let before = "\(prefix) old \(suffix)"
+        let after = "\(prefix) new \(suffix)"
+
+        let diff = TextDiffEngine().diff(before: before, after: after)
+        XCTAssertTrue(diff.isMeaningful)
+        XCTAssertEqual(diff.before, "old")
+        XCTAssertEqual(diff.after, "new")
     }
 
     func testDiffClassifiesWordOrderAndIgnoresWhitespaceOnlyChanges() {
@@ -444,6 +457,133 @@ final class WriteSenseTests: XCTestCase {
         XCTAssertEqual(store.pruned(history: history, retentionDays: 0), .empty)
     }
 
+    func testDiagnosticExportCannotIncludeRetainedWritingFragments() throws {
+        let history = WritingHistory(
+            correctionEvents: [
+                CorrectionEvent(
+                    sessionID: UUID(),
+                    applicationName: "Notes",
+                    applicationBundleID: "com.apple.Notes",
+                    changedFragmentBefore: "ULTRA_SECRET_ORIGINAL",
+                    changedFragmentAfter: "ULTRA_SECRET_REPLACEMENT",
+                    classification: .replacement,
+                    category: .vocabulary
+                )
+            ],
+            diagnosticEvents: [
+                DiagnosticEvent(
+                    operation: .textReplacement,
+                    succeeded: false,
+                    applicationBundleID: "com.apple.Notes",
+                    errorCode: .staleOrUnsupportedRange
+                )
+            ]
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(DiagnosticsExport.make(from: history))
+
+        XCTAssertNil(data.range(of: Data("ULTRA_SECRET_ORIGINAL".utf8)))
+        XCTAssertNil(data.range(of: Data("ULTRA_SECRET_REPLACEMENT".utf8)))
+        XCTAssertNotNil(data.range(of: Data("stale_or_unsupported_range".utf8)))
+    }
+
+    func testDiagnosticsSummaryUsesOnlyContentFreeOperationalEvents() {
+        let now = Date()
+        let history = WritingHistory(
+            suggestionEvents: [
+                SuggestionFeedbackEvent(
+                    category: .agreement,
+                    outcome: .accepted,
+                    wasPersonalized: true,
+                    patternID: nil,
+                    applicationBundleID: "com.apple.Notes",
+                    createdAt: now
+                ),
+                SuggestionFeedbackEvent(
+                    category: .agreement,
+                    outcome: .rejected,
+                    wasPersonalized: false,
+                    patternID: nil,
+                    applicationBundleID: "com.apple.Notes",
+                    createdAt: now
+                )
+            ],
+            editingSessions: [
+                EditingSessionRecord(
+                    id: UUID(),
+                    applicationName: "Notes",
+                    applicationBundleID: "com.apple.Notes",
+                    startedAt: now,
+                    lastUpdatedAt: now
+                )
+            ],
+            privacyAuditEvents: [
+                PrivacyAuditEvent(action: .secureFieldBlocked, applicationBundleID: "com.apple.Notes")
+            ],
+            diagnosticEvents: [
+                DiagnosticEvent(operation: .localReview, succeeded: true, durationMilliseconds: 100),
+                DiagnosticEvent(operation: .localReview, succeeded: true, durationMilliseconds: 300),
+                DiagnosticEvent(operation: .textReplacement, succeeded: false),
+                DiagnosticEvent(operation: .permissionUnavailable, succeeded: false)
+            ],
+            compatibilityObservations: [
+                CompatibilityObservation(
+                    applicationName: "Notes",
+                    applicationBundleID: "com.apple.Notes",
+                    result: .readWrite
+                )
+            ],
+            applicationRuns: [
+                ApplicationRunRecord(id: UUID(), startedAt: now, endedAt: now, cleanExit: true),
+                ApplicationRunRecord(id: UUID(), startedAt: now, endedAt: now, cleanExit: false)
+            ]
+        )
+
+        let summary = DiagnosticsSummary.make(from: history, now: now)
+        XCTAssertEqual(summary.completedRunCount, 2)
+        XCTAssertEqual(summary.uncleanRunCount, 1)
+        XCTAssertEqual(summary.crashFreeRunRate, 0.5)
+        XCTAssertEqual(summary.averageLocalReviewMilliseconds, 200)
+        XCTAssertEqual(summary.p95LocalReviewMilliseconds, 300)
+        XCTAssertEqual(summary.replacementFailureCount, 1)
+        XCTAssertEqual(summary.permissionFailureCount, 1)
+        XCTAssertEqual(summary.secureContextBlockCount, 1)
+        XCTAssertEqual(summary.compatibilityCheckCount, 1)
+        XCTAssertEqual(summary.weeklyActiveDays, 1)
+        XCTAssertEqual(summary.retainedSuggestionAcceptanceRate, 0.5)
+    }
+
+    func testZeroActivityRetentionPreservesEnabledBetaDiagnostics() {
+        let now = Date()
+        let history = WritingHistory(
+            correctionEvents: [correctionEvent(at: now)],
+            diagnosticEvents: [
+                DiagnosticEvent(operation: .localReview, succeeded: true, createdAt: now)
+            ],
+            compatibilityObservations: [
+                CompatibilityObservation(
+                    applicationName: "Notes",
+                    applicationBundleID: "com.apple.Notes",
+                    result: .readWrite,
+                    createdAt: now
+                )
+            ]
+        )
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriteSenseDiagnosticRetention-\(UUID().uuidString)")
+        let store = ProfileStore(
+            directoryURL: directory,
+            keychainService: "com.writesense.tests.\(UUID().uuidString)"
+        )
+        defer { store.deleteAllData() }
+
+        let pruned = store.pruned(history: history, retentionDays: 0, now: now)
+        XCTAssertTrue(pruned.correctionEvents.isEmpty)
+        XCTAssertEqual(pruned.diagnosticEvents?.count, 1)
+        XCTAssertEqual(pruned.compatibilityObservations?.count, 1)
+    }
+
     func testPlaintextPrototypeProfileMigratesToEncryptedStorage() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("WriteSenseMigration-\(UUID().uuidString)")
@@ -465,6 +605,83 @@ final class WriteSenseTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(
             atPath: directory.appendingPathComponent("writing-profile.enc").path
         ))
+    }
+
+    func testEncryptedBackupRecoversLastKnownGoodProfile() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriteSenseRecovery-\(UUID().uuidString)")
+        let service = "com.writesense.tests.\(UUID().uuidString)"
+        let store = ProfileStore(directoryURL: directory, keychainService: service)
+
+        var first = WritingProfile.empty
+        first.vocabulary = ["first"]
+        XCTAssertTrue(store.save(profile: first))
+        var second = WritingProfile.empty
+        second.vocabulary = ["second"]
+        XCTAssertTrue(store.save(profile: second))
+
+        let primary = directory.appendingPathComponent("writing-profile.enc")
+        try Data("corrupted-primary".utf8).write(to: primary, options: [.atomic])
+
+        let recoveringStore = ProfileStore(directoryURL: directory, keychainService: service)
+        defer { recoveringStore.deleteAllData() }
+        let recovered = recoveringStore.loadProfile()
+
+        XCTAssertEqual(recovered.vocabulary, Set(["first"]))
+        XCTAssertFalse(recoveringStore.hasLoadFailure)
+        XCTAssertNotNil(recoveringStore.lastRecoveryMessage)
+        XCTAssertTrue(recoveringStore.recoveredFileNames.contains("writing-profile.enc"))
+    }
+
+    @MainActor
+    func testRecoveredSettingsFailClosedBeforeAppModelStarts() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriteSenseSettingsRecovery-\(UUID().uuidString)")
+        let service = "com.writesense.tests.\(UUID().uuidString)"
+        let store = ProfileStore(directoryURL: directory, keychainService: service)
+        let risky = StoredSettings(
+            approvedBundleIDs: ["com.apple.Terminal"],
+            learningEnabled: true,
+            diagnosticsEnabled: true
+        )
+        XCTAssertTrue(store.save(settings: risky))
+        var second = risky
+        second.capitalizationChecksEnabled = false
+        XCTAssertTrue(store.save(settings: second))
+        try Data("corrupt-settings".utf8).write(
+            to: directory.appendingPathComponent("settings.enc"),
+            options: [.atomic]
+        )
+
+        let recoveringStore = ProfileStore(directoryURL: directory, keychainService: service)
+        defer { recoveringStore.deleteAllData() }
+        let model = AppModel(store: recoveringStore)
+
+        XCTAssertFalse(model.isLearningActive)
+        XCTAssertFalse(model.diagnosticsEnabled)
+        XCTAssertFalse(model.onboardingCompleted)
+        XCTAssertTrue(model.approvedApplications.isEmpty)
+        XCTAssertTrue(model.storageAvailable)
+    }
+
+    func testRunMarkerDetectsUncleanAndCleanTermination() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WriteSenseRunMarker-\(UUID().uuidString)")
+        let service = "com.writesense.tests.\(UUID().uuidString)"
+        let store = ProfileStore(directoryURL: directory, keychainService: service)
+        defer { store.deleteAllData() }
+        let firstDate = Date(timeIntervalSince1970: 100)
+        let secondDate = Date(timeIntervalSince1970: 200)
+
+        let first = try XCTUnwrap(store.beginApplicationRun(now: firstDate))
+        XCTAssertNil(first.previousUnclean)
+        let second = try XCTUnwrap(store.beginApplicationRun(now: secondDate))
+        XCTAssertEqual(second.previousUnclean, first.current)
+
+        store.finishApplicationRun(second.current.id)
+        let third = try XCTUnwrap(store.beginApplicationRun(now: Date(timeIntervalSince1970: 300)))
+        XCTAssertNil(third.previousUnclean)
+        store.finishApplicationRun(third.current.id)
     }
 
     func testUnreadableEncryptedStorageFailsClosedUntilDeletion() throws {
@@ -510,7 +727,7 @@ final class WriteSenseTests: XCTestCase {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         let export = try decoder.decode(WriteSenseExport.self, from: exportData)
-        XCTAssertEqual(export.formatVersion, 1)
+        XCTAssertEqual(export.formatVersion, 2)
         XCTAssertEqual(export.profile.vocabulary, Set(["confidentialterm"]))
 
         XCTAssertTrue(store.deleteAllData())
