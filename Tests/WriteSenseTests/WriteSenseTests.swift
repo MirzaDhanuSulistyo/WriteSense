@@ -37,6 +37,25 @@ final class WriteSenseTests: XCTestCase {
         XCTAssertTrue(result.suggestions.contains { $0.category == .punctuation && $0.suggestedText == "?" })
     }
 
+    func testCapitalizationChecksCanBeDisabled() {
+        let result = LocalLanguageEngine().analyze(
+            "this sentence is otherwise correct.",
+            profile: .empty,
+            applicationBundleID: "com.apple.TextEdit",
+            includeCapitalization: false
+        )
+
+        XCTAssertFalse(result.suggestions.contains { $0.category == .capitalization })
+    }
+
+    func testLegacySettingsEnableCapitalizationByDefault() throws {
+        let data = #"{"approvedBundleIDs":["com.apple.TextEdit"],"learningEnabled":true}"#.data(using: .utf8)!
+        let settings = try JSONDecoder().decode(StoredSettings.self, from: data)
+
+        XCTAssertTrue(settings.capitalizationChecksEnabled)
+        XCTAssertTrue(settings.learningEnabled)
+    }
+
     func testAmbiguousIncompleteQuestionRequestsClarification() {
         let result = LocalLanguageEngine().analyze(
             "how do me",

@@ -64,7 +64,11 @@ final class FoundationModelWritingService {
         #endif
     }
 
-    func review(_ text: String, profile: WritingProfile) async throws -> [Suggestion] {
+    func review(
+        _ text: String,
+        profile: WritingProfile,
+        includeCapitalization: Bool = true
+    ) async throws -> [Suggestion] {
         let currentStatus = status
         guard currentStatus.isAvailable else {
             throw FoundationModelServiceError.unavailable(currentStatus)
@@ -72,7 +76,11 @@ final class FoundationModelWritingService {
 
         #if canImport(FoundationModels)
         if #available(macOS 26.0, *) {
-            let suggestions = try await reviewWithSystemModel(text, profile: profile)
+            let suggestions = try await reviewWithSystemModel(
+                text,
+                profile: profile,
+                includeCapitalization: includeCapitalization
+            )
             guard !suggestions.isEmpty else { throw FoundationModelServiceError.noUsableSuggestions }
             return suggestions
         }
@@ -82,7 +90,14 @@ final class FoundationModelWritingService {
 
     #if canImport(FoundationModels)
     @available(macOS 26.0, *)
-    private func reviewWithSystemModel(_ text: String, profile: WritingProfile) async throws -> [Suggestion] {
+    private func reviewWithSystemModel(
+        _ text: String,
+        profile: WritingProfile,
+        includeCapitalization: Bool
+    ) async throws -> [Suggestion] {
+        let capitalizationInstruction = includeCapitalization
+            ? "Correct sentence capitalization when needed."
+            : "Do not suggest capitalization-only changes."
         let session = LanguageModelSession(instructions: """
             You are WriteSense, a careful English writing coach running privately on the user's Mac.
             Identify concrete spelling, grammar, punctuation, clarity, and concision problems.
@@ -91,6 +106,7 @@ final class FoundationModelWritingService {
             When an auxiliary tense construction is malformed, preserve its auxiliaries and repair the verb form.
             For two explicitly completed past actions linked by “before,” check whether the earlier action needs past perfect.
             Use subject pronouns in compound subjects and remove redundant comparative forms.
+            \(capitalizationInstruction)
             Never invent facts. Return at most eight high-confidence corrections.
             Every originalText must be an exact, non-empty substring copied from the supplied paragraph.
             replacement must contain only the text that should replace originalText.
@@ -115,11 +131,19 @@ final class FoundationModelWritingService {
             </paragraph>
             """
         let response = try await session.respond(to: prompt, generating: ModelWritingReview.self)
-        return validatedSuggestions(from: response.content.suggestions, in: text)
+        return validatedSuggestions(
+            from: response.content.suggestions,
+            in: text,
+            includeCapitalization: includeCapitalization
+        )
     }
 
     @available(macOS 26.0, *)
-    private func validatedSuggestions(from items: [ModelWritingIssue], in text: String) -> [Suggestion] {
+    private func validatedSuggestions(
+        from items: [ModelWritingIssue],
+        in text: String,
+        includeCapitalization: Bool
+    ) -> [Suggestion] {
         let source = text as NSString
         var usedRanges: [NSRange] = []
         var suggestions: [Suggestion] = []
@@ -143,11 +167,13 @@ final class FoundationModelWritingService {
             }
             guard selectedRange.location != NSNotFound else { continue }
 
+            let issueCategory = category(for: item.category)
+            guard includeCapitalization || issueCategory != .capitalization else { continue }
             usedRanges.append(selectedRange)
             suggestions.append(Suggestion(
                 originalText: original,
                 suggestedText: replacement,
-                category: category(for: item.category),
+                category: issueCategory,
                 explanation: item.explanation,
                 confidence: 0.86,
                 range: TextRange(location: selectedRange.location, length: selectedRange.length),

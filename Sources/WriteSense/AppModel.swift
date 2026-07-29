@@ -5,6 +5,7 @@ import Foundation
 @MainActor
 final class AppModel: ObservableObject {
     @Published var isLearningActive: Bool
+    @Published private(set) var capitalizationChecksEnabled: Bool
     @Published private(set) var permissionTrusted: Bool
     @Published private(set) var currentApplicationName = "No supported app detected"
     @Published private(set) var currentBundleID: String?
@@ -65,6 +66,7 @@ final class AppModel: ObservableObject {
         let loadedSettings = store.loadSettings()
         settings = loadedSettings
         isLearningActive = loadedSettings.learningEnabled
+        capitalizationChecksEnabled = loadedSettings.capitalizationChecksEnabled
         var loadedProfile = store.loadProfile()
         loadedProfile.patterns.removeAll { $0.applicationBundleID == "com.apple.Terminal" }
         loadedProfile.vocabulary.subtract([
@@ -116,6 +118,16 @@ final class AppModel: ObservableObject {
         toggleLearning()
     }
 
+    func setCapitalizationChecksEnabled(_ enabled: Bool) {
+        guard capitalizationChecksEnabled != enabled else { return }
+        capitalizationChecksEnabled = enabled
+        settings.capitalizationChecksEnabled = enabled
+        store.save(settings: settings)
+        latestSuggestions.removeAll { !enabled && $0.category == .capitalization }
+        lastPromptedParagraph = nil
+        notice = enabled ? "Capitalization suggestions enabled." : "Capitalization suggestions disabled."
+    }
+
     func toggleApplication(_ application: SupportedApplication) {
         if settings.approvedBundleIDs.contains(application.bundleID) {
             settings.approvedBundleIDs.remove(application.bundleID)
@@ -152,7 +164,12 @@ final class AppModel: ObservableObject {
         }
         currentCapture = captured
         lastPromptedParagraph = captured.paragraph
-        let analysis = languageEngine.analyze(captured.paragraph, profile: profile, applicationBundleID: captured.applicationBundleID)
+        let analysis = languageEngine.analyze(
+            captured.paragraph,
+            profile: profile,
+            applicationBundleID: captured.applicationBundleID,
+            includeCapitalization: capitalizationChecksEnabled
+        )
         lastReviewLanguage = analysis.language
         latestSuggestions = analysis.suggestions
         notice = analysis.suggestions.isEmpty ? "No suggestions found in this paragraph." : nil
@@ -195,12 +212,14 @@ final class AppModel: ObservableObject {
             let local = self.languageEngine.analyze(
                 captured.paragraph,
                 profile: self.profile,
-                applicationBundleID: captured.applicationBundleID
+                applicationBundleID: captured.applicationBundleID,
+                includeCapitalization: self.capitalizationChecksEnabled
             )
             do {
                 let modelSuggestions = try await self.foundationModelService.review(
                     captured.paragraph,
-                    profile: self.profile
+                    profile: self.profile,
+                    includeCapitalization: self.capitalizationChecksEnabled
                 )
                 self.lastReviewLanguage = local.language
                 self.latestSuggestions = self.merging(local.suggestions, with: modelSuggestions)
@@ -465,7 +484,12 @@ final class AppModel: ObservableObject {
         // when the paragraph was already complete when WriteSense started.
         if lastPromptedParagraph != captured.paragraph {
             lastPromptedParagraph = captured.paragraph
-            let analysis = languageEngine.analyze(captured.paragraph, profile: profile, applicationBundleID: captured.applicationBundleID)
+            let analysis = languageEngine.analyze(
+                captured.paragraph,
+                profile: profile,
+                applicationBundleID: captured.applicationBundleID,
+                includeCapitalization: capitalizationChecksEnabled
+            )
             if !analysis.suggestions.isEmpty {
                 lastReviewLanguage = analysis.language
                 latestSuggestions = analysis.suggestions

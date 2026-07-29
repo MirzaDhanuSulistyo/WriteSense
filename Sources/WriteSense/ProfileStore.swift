@@ -56,10 +56,39 @@ final class ProfileStore {
 struct StoredSettings: Codable {
     var approvedBundleIDs: Set<String>
     var learningEnabled: Bool
+    var capitalizationChecksEnabled: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case approvedBundleIDs
+        case learningEnabled
+        case capitalizationChecksEnabled
+    }
+
+    init(
+        approvedBundleIDs: Set<String>,
+        learningEnabled: Bool,
+        capitalizationChecksEnabled: Bool = true
+    ) {
+        self.approvedBundleIDs = approvedBundleIDs
+        self.learningEnabled = learningEnabled
+        self.capitalizationChecksEnabled = capitalizationChecksEnabled
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        approvedBundleIDs = try container.decodeIfPresent(Set<String>.self, forKey: .approvedBundleIDs)
+            ?? Self.defaults.approvedBundleIDs
+        learningEnabled = try container.decodeIfPresent(Bool.self, forKey: .learningEnabled)
+            ?? Self.defaults.learningEnabled
+        // Existing installations predate this setting, so preserve the former
+        // behavior by enabling capitalization checks during migration.
+        capitalizationChecksEnabled = try container.decodeIfPresent(Bool.self, forKey: .capitalizationChecksEnabled) ?? true
+    }
 
     static let defaults = StoredSettings(
         approvedBundleIDs: Set(["com.apple.TextEdit", "com.apple.Notes", "com.apple.mail"]),
-        learningEnabled: false
+        learningEnabled: false,
+        capitalizationChecksEnabled: true
     )
 }
 

@@ -11,7 +11,12 @@ struct LanguageAnalysis {
 /// NaturalLanguage supplies token and language context; the deterministic rules
 /// keep the MVP private, fast, and usable without a model download.
 final class LocalLanguageEngine {
-    func analyze(_ text: String, profile: WritingProfile, applicationBundleID: String? = nil) -> LanguageAnalysis {
+    func analyze(
+        _ text: String,
+        profile: WritingProfile,
+        applicationBundleID: String? = nil,
+        includeCapitalization: Bool = true
+    ) -> LanguageAnalysis {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return LanguageAnalysis(language: "Unknown", suggestions: [])
         }
@@ -22,7 +27,9 @@ final class LocalLanguageEngine {
         findings.append(contentsOf: spellingFindings(in: text, profile: profile, conservative: isTerminal))
         findings.append(contentsOf: structuralQuestionFindings(in: text))
         findings.append(contentsOf: systemGrammarFindings(in: text))
-        findings.append(contentsOf: capitalizationFindings(in: text))
+        if includeCapitalization {
+            findings.append(contentsOf: capitalizationFindings(in: text))
+        }
         findings.append(contentsOf: repeatedWordFindings(in: text))
         findings.append(contentsOf: pronounFindings(in: text))
         findings.append(contentsOf: phraseFindings(in: text))

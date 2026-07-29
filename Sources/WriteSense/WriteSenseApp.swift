@@ -413,6 +413,17 @@ struct SettingsView: View {
                 Text("Deep Review uses Apple Foundation Models entirely on-device. No paragraph or API key is sent to a server.")
             }
 
+            Section {
+                Toggle("Sentence capitalization", isOn: Binding(
+                    get: { model.capitalizationChecksEnabled },
+                    set: { model.setCapitalizationChecksEnabled($0) }
+                ))
+            } header: {
+                Text("Writing checks")
+            } footer: {
+                Text("Turn this off to suppress suggestions that only capitalize the beginning of a sentence.")
+            }
+
             Section("Approved applications") {
                 ForEach(SupportedApplication.defaults) { application in
                     Toggle(isOn: Binding(

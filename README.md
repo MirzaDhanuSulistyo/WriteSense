@@ -16,6 +16,7 @@ WriteSense is a privacy-first macOS menu bar writing coach. The prototype reads 
 - Optional on-device Deep Review with Apple Foundation Models on macOS 26+.
 - Personalized ranking based on repeated edits and accepted/rejected suggestions.
 - Accept, edit, reject, ignore, and undo suggestion actions.
+- Persisted switch for enabling or disabling sentence-capitalization suggestions.
 - Local JSON profile storage in `~/Library/Application Support/WriteSense`.
 - Insights, pattern controls, and complete data deletion.
 
