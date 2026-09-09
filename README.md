@@ -98,3 +98,7 @@ On macOS 26+, Deep Review uses Apple Foundation Models when Apple Intelligence i
 - [Support and troubleshooting](docs/support.md)
 - [Beta feedback plan](docs/beta-feedback.md)
 - [Monetization strategy](docs/monetize.md)
+
+## Part of Andura
+
+WriteSense is part of [Andura](https://github.com/MirzaDhanuSulistyo/Andura) — I release products from real problems. Product page: [andura.io/work/writesense](https://andura.io/work/writesense/).
